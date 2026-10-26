@@ -1,0 +1,715 @@
+#include <stdio.h>
+
+
+
+#include <rl_tools/operations/arm.h>
+
+#include <rl_tools/nn/layers/standardize/operations_generic.h>
+#include <rl_tools/nn/layers/dense/operations_arm/opt.h>
+#include <rl_tools/containers/matrix/operations_arm/opt.h>
+#include <rl_tools/nn/layers/sample_and_squash/operations_generic.h>
+#include <rl_tools/nn/layers/gru/operations_generic.h>
+#include <rl_tools/nn_models/mlp/operations_generic.h>
+#include <rl_tools/nn_models/sequential/operations_generic.h>
+
+#include <rl_tools/inference/executor/executor.h>
+
+#include "blob/policy.h"
+
+extern "C" {
+    #include "rx/rx.h"
+    #include "flight/mixer.h"
+    #include "sensors/gyro.h"
+    #include "sensors/acceleration.h"
+    #include "flight/imu.h"
+    #include "drivers/time.h"
+    #include "build/debug.h"
+    #include "fc/runtime_config.h"
+    #include "fc/core.h"
+}
+
+// STM32 CMSIS headers pulled in above #define RNG as a peripheral register alias,
+// which collides with rl_tools's RNG template parameter name in c_backend.h below
+#undef RNG
+
+namespace rlt = rl_tools;
+
+namespace other{
+    using DEV_SPEC = rlt::devices::DefaultARMSpecification;
+    using DEVICE = rlt::devices::arm::OPT<DEV_SPEC>;
+}
+
+struct RL_TOOLS_INFERENCE_APPLICATIONS_L2F_CONFIG{
+    using DEVICE = other::DEVICE;
+    using TI = typename other::DEVICE::index_t;
+    using RNG = other::DEVICE::SPEC::RANDOM::ENGINE<>;
+    static constexpr TI TEST_SEQUENCE_LENGTH_ACTUAL = 5;
+    static constexpr TI TEST_BATCH_SIZE_ACTUAL = 2;
+    using ACTOR_TYPE_ORIGINAL = rlt::checkpoint::actor::TYPE;
+    using POLICY_TEST = rlt::checkpoint::actor::TYPE::template CHANGE_BATCH_SIZE<TI, 1>::template CHANGE_SEQUENCE_LENGTH<TI, 1>;
+    using POLICY = ACTOR_TYPE_ORIGINAL::template CHANGE_BATCH_SIZE<TI, 1>::template CHANGE_SEQUENCE_LENGTH<TI, 1>;
+    using T = typename POLICY::SPEC::T;
+    static auto& policy() {
+        return rlt::checkpoint::actor::module;
+    }
+    static constexpr TI ACTION_HISTORY_LENGTH = 1;
+    static constexpr TI CONTROL_INTERVAL_INTERMEDIATE_NS = 2.5 * 1000 * 1000; // Inference is at 500hz
+    static constexpr TI CONTROL_INTERVAL_NATIVE_NS = 10 * 1000 * 1000; // Training is 100hz
+    static constexpr TI TIMING_STATS_NUM_STEPS = 100;
+    static constexpr bool FORCE_SYNC_INTERMEDIATE = false;
+    static constexpr TI FORCE_SYNC_NATIVE = 4;
+    static constexpr bool DYNAMIC_ALLOCATION = false;
+    using WARNING_LEVELS = rlt::inference::executor::WarningLevelsDefault<T>;
+};
+
+// #define RL_TOOLS_DISABLE_TEST
+#include <rl_tools/inference/applications/l2f/c_backend.h>
+
+
+using T = RL_TOOLS_INFERENCE_APPLICATIONS_L2F_CONFIG::T;
+using TI = RL_TOOLS_INFERENCE_APPLICATIONS_L2F_CONFIG::TI;
+
+uint64_t previous_micros = 0;
+bool previous_micros_set = false;
+uint32_t micros_overflow_counter = 0;
+
+bool first_run = true;
+bool active = false;
+uint64_t active_since_us = 0;
+
+// Soft-start: real flight data (2026-09-01 blackbox) showed the raw action applied
+// to motors uncapped and at full authority in the very first control step after arm,
+// producing an asymmetric current spike that browned out the FC within ~70ms. Ramp
+// commanded thrust in over SOFT_START_DURATION_US to bound that startup transient.
+// 2026-09-24: 300ms/0.25 floor still let all 4 motors step together hard enough on
+// engage to sag vbat and brown out (log5, log6 on real hardware). Widened the ramp
+// and dropped the floor further to shrink that initial current step.
+// 2026-09-24 (2): log7 (with the 2000ms/0.05 version above) still went unstable ~150ms
+// after engage, but as a growing oscillation rather than a single step -- that instance
+// looks like the motor-index remap issue (see target_indices below), not the ramp shape.
+// Softening further anyway since it's cheap and can only reduce the initial current step.
+// 2026-09-24 (6): went too far the other way. log8 shows AUX2 engaged while the aircraft
+// was already tipping -- roll rate climbed 0 to 248deg/s over 120ms while all 4 motors sat
+// almost perfectly even (near the 722 hover center), because at that point soft_start_scale
+// was still pinned near the 2% floor, so ~98% of whatever correction the policy wanted was
+// suppressed. It couldn't react to a real disturbance and it dropped. Shortening the ramp
+// and raising the floor so it still avoids an instant full-power step but has real authority
+// within a couple hundred ms instead of multiple seconds.
+// 2026-09-24 (7): measured actual control response time at ~200ms on the bench. Tightening
+// the ramp to sit under that (150ms) with a higher floor (40%) so meaningful correction
+// authority is available before the aircraft can react to it, not after.
+static constexpr T SOFT_START_DURATION_US = 150 * 1000;
+static constexpr T SOFT_START_MIN_SCALE = 0.40;
+
+template <typename T>
+T clip(T x, T min, T max){
+	if(x > max){
+		return max;
+	}
+	if(x < min){
+		return min;
+	}
+	return x;
+}
+template <typename T>
+void quaternion_multiplication(T q1[4], T q2[4], T q_res[4]){
+	q_res[0] = q1[0] * q2[0] - q1[1] * q2[1] - q1[2] * q2[2] - q1[3] * q2[3];
+	q_res[1] = q1[0] * q2[1] + q1[1] * q2[0] + q1[2] * q2[3] - q1[3] * q2[2];
+	q_res[2] = q1[0] * q2[2] - q1[1] * q2[3] + q1[2] * q2[0] + q1[3] * q2[1];
+	q_res[3] = q1[0] * q2[3] + q1[1] * q2[2] - q1[2] * q2[1] + q1[3] * q2[0];
+}
+template <typename T>
+void quaternion_conjugate(T q[4], T q_res[4]){
+	q_res[0] = +q[0];
+	q_res[1] = -q[1];
+	q_res[2] = -q[2];
+	q_res[3] = -q[3];
+}
+template <typename T, int ELEMENT>
+T quaternion_to_rotation_matrix(T q[4]){
+	// row-major
+	T qw = q[0];
+	T qx = q[1];
+	T qy = q[2];
+	T qz = q[3];
+
+	static_assert(ELEMENT >= 0 && ELEMENT < 9);
+	if constexpr(ELEMENT == 0){
+		return 1 - 2*qy*qy - 2*qz*qz;
+	}
+	if constexpr(ELEMENT == 1){
+		return     2*qx*qy - 2*qw*qz;
+	}
+	if constexpr(ELEMENT == 2){
+		return     2*qx*qz + 2*qw*qy;
+	}
+	if constexpr(ELEMENT == 3){
+		return     2*qx*qy + 2*qw*qz;
+	}
+	if constexpr(ELEMENT == 4){
+		return 1 - 2*qx*qx - 2*qz*qz;
+	}
+	if constexpr(ELEMENT == 5){
+		return     2*qy*qz - 2*qw*qx;
+	}
+	if constexpr(ELEMENT == 6){
+		return     2*qx*qz - 2*qw*qy;
+	}
+	if constexpr(ELEMENT == 7){
+		return     2*qy*qz + 2*qw*qx;
+	}
+	if constexpr(ELEMENT == 8){
+		return 1 - 2*qx*qx - 2*qy*qy;
+	}
+	return 0;
+}
+
+template <typename T>
+void quaternion_to_rotation_matrix(T q[4], T R[9]){
+	R[0] = quaternion_to_rotation_matrix<T, 0>(q);
+	R[1] = quaternion_to_rotation_matrix<T, 1>(q);
+	R[2] = quaternion_to_rotation_matrix<T, 2>(q);
+	R[3] = quaternion_to_rotation_matrix<T, 3>(q);
+	R[4] = quaternion_to_rotation_matrix<T, 4>(q);
+	R[5] = quaternion_to_rotation_matrix<T, 5>(q);
+	R[6] = quaternion_to_rotation_matrix<T, 6>(q);
+	R[7] = quaternion_to_rotation_matrix<T, 7>(q);
+	R[8] = quaternion_to_rotation_matrix<T, 8>(q);
+}
+
+template <typename T>
+void rotate_vector(T R[9], T v[3], T v_rotated[3]){
+	v_rotated[0] = R[0] * v[0] + R[1] * v[1] + R[2] * v[2];
+	v_rotated[1] = R[3] * v[0] + R[4] * v[1] + R[5] * v[2];
+	v_rotated[2] = R[6] * v[0] + R[7] * v[1] + R[8] * v[2];
+}
+enum class TestObservationMode: TI{
+    ANGULAR_VELOCITY = 0,
+    ORIENTATION = 1,
+    LINEAR_VELOCITY = 2,
+    POSITION = 3,
+    ACTION_HISTORY = 4,
+};
+
+// constants
+// 2026-10-21: were 0.3 / 0.3. The policy trained without any clip (starts up to 0.44 m away at up to 1 m/s); clipping
+// velocity at 0.3 m/s made it blind to faster motion -- the takeoff overshot from 0.04 to 0.74 m at 0.8 m/s while
+// it saw 0.3 m/s. Must match EXTERNAL_RANGE_* below and SEND_RANGE_* in room_pose.py.
+static constexpr T MAX_POSITION_ERROR = 0.5;
+static constexpr T MAX_LINEAR_VELOCITY_ERROR = 1.5;
+// 2026-10-23: d5/d6 hovered with a slow 0.3-3 Hz sway (roll/pitch sd 7-11 deg, 98% of it below 3 Hz -- not a wobble).
+// Scaling the position observation down makes the policy pull back to the target more gently while velocity still
+// damps. Sim (dropouts, weak front-right rotor 0.8, battery 0.93, flashed dropout999 policy): gain 1.0 / 0.8 / 0.6
+// -> hover speed 47 / 43 / 38 cm/s, distance 22 / 25 / 28 cm, crashes 25.5 / 21.5 / 20.9%. The steady part of the extra
+// distance is taken out by room_pose.py's trim. Mirrors POSITION_GAIN in the post-training environment.h.
+static constexpr T POSITION_OBSERVATION_GAIN = 0.7;
+
+// setpoint
+static T target_orientation[4] = {1, 0, 0, 0};
+static T target_linear_velocity[3] = {0, 0, 0};
+
+// Position from the laptop (wall markers seen by the FPV camera), 2026-10-17. The laptop sends
+// position error (current - target) and velocity, expressed in the drone's own heading frame
+// (x forward, y left, z up, yaw removed), so the FC's drifting yaw estimate doesn't matter:
+//   CH9..CH11 (rcData[8..10]) = position error, CH12..CH14 (rcData[11..13]) = velocity,
+//   full deflection (+-512 around 1500) = +-EXTERNAL_RANGE_POSITION m / +-EXTERNAL_RANGE_VELOCITY m/s,
+//   CH15 (rcData[14]) = valid + heartbeat: alternates ~2012 / ~1756 with every laptop update,
+//   ~988 when the laptop has no fix. No heartbeat change for EXTERNAL_TIMEOUT_US -> not valid.
+// Not valid -> position and velocity observations are 0, as before this link existed.
+static constexpr T EXTERNAL_RANGE_POSITION = 0.5; // = SEND_RANGE_POSITION in room_pose.py (was 0.3 for both)
+static constexpr T EXTERNAL_RANGE_VELOCITY = 1.5; // = SEND_RANGE_VELOCITY
+static constexpr uint64_t EXTERNAL_TIMEOUT_US = 250 * 1000;
+static bool external_valid = false;
+static T external_position[3] = {0, 0, 0};   // heading frame
+static T external_velocity[3] = {0, 0, 0};   // heading frame
+static T external_heartbeat = 0;
+static uint64_t external_heartbeat_us = 0;
+static bool external_new = false; // a new laptop value arrived since the predictor last used one
+
+void update_external(uint64_t now){
+	T heartbeat = rcData[14];
+	if(heartbeat - external_heartbeat > 100 || external_heartbeat - heartbeat > 100){
+		external_heartbeat = heartbeat;
+		external_heartbeat_us = now;
+		external_new = true;
+	}
+	external_valid = heartbeat > 1600 && now - external_heartbeat_us < EXTERNAL_TIMEOUT_US;
+	for(TI i = 0; i < 3; i++){
+		external_position[i] = external_valid ? (rcData[8 + i] - 1500) / (T)512 * EXTERNAL_RANGE_POSITION : 0;
+		external_velocity[i] = external_valid ? (rcData[11 + i] - 1500) / (T)512 * EXTERNAL_RANGE_VELOCITY : 0;
+	}
+}
+
+// yaw (rotation about z) of a quaternion w, x, y, z
+T quaternion_yaw(T q[4]){
+	return atan2f(2 * (q[0] * q[3] + q[1] * q[2]), 1 - 2 * (q[2] * q[2] + q[3] * q[3]));
+}
+
+// On-board delay compensation, 2026-10-17. The laptop's values are ~130 ms old when they arrive (video
+// 112 ms + laptop + radio) and only change every 50 ms; the policy fed with them directly crashed in
+// every simulated hover. Instead, each new laptop value is taken as PREDICTOR_DELAY ticks old (velocity
+// PREDICTOR_VELOCITY_EXTRA ticks older still, from the laptop's 0.08 s low-pass) and integrated forward to
+// now with the accelerometer (rotated by the attitude, gravity removed), buffered at 100 Hz; between laptop
+// values the estimate is dead-reckoned the same way. Mirrors StateExternalPose (PREDICT) in the l2f
+// simulator, which the policy was post-trained with -- keep the constants equal to the ones in
+// src/foundation_policy/post_training/environment.h.
+static constexpr TI PREDICTOR_DELAY = 13;
+static constexpr TI PREDICTOR_VELOCITY_EXTRA = 8;
+static constexpr TI PREDICTOR_HISTORY = 24;
+static_assert(PREDICTOR_DELAY + PREDICTOR_VELOCITY_EXTRA < PREDICTOR_HISTORY);
+static constexpr uint64_t PREDICTOR_TICK_US = 10 * 1000;
+static constexpr T GRAVITY = 9.81;
+static T predictor_accel[PREDICTOR_HISTORY][3]; // target frame, m/s^2, slot = tick % PREDICTOR_HISTORY
+static TI predictor_tick = 0;
+static uint64_t predictor_tick_us = 0;
+static bool predictor_have_estimate = false;
+static T predictor_position[3] = {0, 0, 0};  // target frame
+static T predictor_velocity[3] = {0, 0, 0};
+// 2026-10-21 (f5-f9, first flights): in flight the laptop loses the markers every ~0.5 s for 0.05-0.5 s (hand-held
+// it was ~100% valid). Feeding the policy position 0 ("on target") during each gap made its input jump back and
+// forth; instead keep dead-reckoning with the accelerometer through gaps up to this long.
+static constexpr uint64_t PREDICTOR_DEAD_RECKON_US = 500 * 1000;
+static uint64_t predictor_valid_us = 0;
+
+// 2026-10-21 (log31, props-off hand test): the acceleration computed below carries an offset of 0.5-2 m/s^2
+// (attitude estimate error, vibration) that drifts over seconds and grows with motor speed; integrated over
+// the ~210 ms of prediction it would put up to 0.4 m/s into the velocity the policy sees. A drone that stays
+// near its target accelerates by zero on average, so a running mean (time constant PREDICTOR_OFFSET_TAU) of
+// the acceleration is taken as the offset and subtracted. It runs from boot, also while RAPTOR is off, in the
+// drone's own heading frame (tilt only, offsets are body-fixed), so it has settled when SF is switched on in
+// a hover. Mirrors ACCEL_BIAS_TAU in the simulator (environment.h, EXTERNAL_POSE_ACCEL_BIAS_TAU_MS).
+static constexpr T PREDICTOR_OFFSET_TAU = 2.0f;
+static T predictor_offset[3] = {0, 0, 0}; // heading frame, m/s^2
+static uint64_t predictor_offset_tick_us = 0;
+
+// acceleration in the heading frame of the attitude q (FLU): R(tilt of q) * specific force - gravity
+static void heading_frame_acceleration(T q[4], T a[3]){
+	const T psi = quaternion_yaw(q);
+	T q_heading_inv[4] = {cosf(psi / 2), 0, 0, -sinf(psi / 2)}, q_tilt[4], R[9], f[3];
+	quaternion_multiplication(q_heading_inv, q, q_tilt);
+	quaternion_to_rotation_matrix(q_tilt, R);
+	const T scale = GRAVITY / acc.dev.acc_1G;
+	f[0] = acc.accADC.x * scale;
+	f[1] = acc.accADC.y * scale;
+	f[2] = acc.accADC.z * scale;
+	rotate_vector(R, f, a);
+	a[2] -= GRAVITY;
+}
+
+void predictor_offset_update(uint64_t now){
+	if(now - predictor_offset_tick_us < PREDICTOR_TICK_US){
+		return;
+	}
+	if(now - predictor_offset_tick_us > 10 * PREDICTOR_TICK_US){
+		predictor_offset_tick_us = now - PREDICTOR_TICK_US;
+	}
+	quaternion_t q;
+	getQuaternion(&q);
+	T qa[4] = {q.w, q.x, q.y, q.z}, a[3];
+	heading_frame_acceleration(qa, a);
+	while(now - predictor_offset_tick_us >= PREDICTOR_TICK_US){
+		predictor_offset_tick_us += PREDICTOR_TICK_US;
+		for(TI j = 0; j < 3; j++){
+			predictor_offset[j] += (a[j] - predictor_offset[j]) * (PREDICTOR_TICK_US * 1e-6f / PREDICTOR_OFFSET_TAU);
+		}
+	}
+}
+
+void predictor_reset(uint64_t now){
+	for(TI i = 0; i < PREDICTOR_HISTORY; i++){
+		for(TI j = 0; j < 3; j++){
+			predictor_accel[i][j] = 0;
+		}
+	}
+	predictor_tick = 0;
+	predictor_tick_us = now;
+	predictor_have_estimate = false;
+}
+
+// qd: attitude relative to the target frame (what the policy sees), FLU
+void predictor_update(uint64_t now, T qd[4]){
+	if(now - predictor_tick_us > 10 * PREDICTOR_TICK_US){
+		predictor_tick_us = now; // stalled (should not happen while active): don't replay a burst of ticks
+	}
+	if(now - predictor_tick_us < PREDICTOR_TICK_US){
+		return;
+	}
+	// acceleration in the target frame: R(qd) * specific force (accelerometer, FLU, in g) - gravity - offset
+	// (= the heading-frame acceleration rotated by the yaw of qd)
+	T a_heading[3], a[3];
+	heading_frame_acceleration(qd, a_heading);
+	T psi = quaternion_yaw(qd), c = cosf(psi), s = sinf(psi);
+	for(TI j = 0; j < 3; j++){
+		a_heading[j] -= predictor_offset[j];
+	}
+	a[0] = c * a_heading[0] - s * a_heading[1];
+	a[1] = s * a_heading[0] + c * a_heading[1];
+	a[2] = a_heading[2];
+	// laptop value in the target frame (it comes in the heading frame, see update_external)
+	T p_meas[3] = {c * external_position[0] - s * external_position[1], s * external_position[0] + c * external_position[1], external_position[2]};
+	T v_meas[3] = {c * external_velocity[0] - s * external_velocity[1], s * external_velocity[0] + c * external_velocity[1], external_velocity[2]};
+	while(now - predictor_tick_us >= PREDICTOR_TICK_US){
+		predictor_tick_us += PREDICTOR_TICK_US;
+		predictor_tick++;
+		const TI n = predictor_tick, H = PREDICTOR_HISTORY;
+		for(TI j = 0; j < 3; j++){
+			predictor_accel[n % H][j] = a[j];
+		}
+		if(!external_valid){
+			if(predictor_have_estimate && predictor_tick_us - predictor_valid_us < PREDICTOR_DEAD_RECKON_US){
+				for(TI j = 0; j < 3; j++){
+					predictor_velocity[j] += predictor_accel[n % H][j] * PREDICTOR_TICK_US * 1e-6f;
+					predictor_position[j] += predictor_velocity[j] * PREDICTOR_TICK_US * 1e-6f;
+				}
+			}
+			else{
+				predictor_have_estimate = false;
+			}
+			continue;
+		}
+		predictor_valid_us = predictor_tick_us;
+		if(external_new || !predictor_have_estimate){
+			external_new = false;
+			predictor_have_estimate = true;
+			for(TI j = 0; j < 3; j++){
+				T p = p_meas[j], v = v_meas[j];
+				for(TI age = PREDICTOR_DELAY + PREDICTOR_VELOCITY_EXTRA - 1; age >= PREDICTOR_DELAY; age--){
+					v += predictor_accel[(n + H - age) % H][j] * PREDICTOR_TICK_US * 1e-6f;
+				}
+				for(TI age = PREDICTOR_DELAY; age-- > 0;){
+					v += predictor_accel[(n + H - age) % H][j] * PREDICTOR_TICK_US * 1e-6f;
+					p += v * PREDICTOR_TICK_US * 1e-6f;
+				}
+				predictor_position[j] = p;
+				predictor_velocity[j] = v;
+			}
+		}
+		else{
+			for(TI j = 0; j < 3; j++){
+				predictor_velocity[j] += predictor_accel[n % H][j] * PREDICTOR_TICK_US * 1e-6f;
+				predictor_position[j] += predictor_velocity[j] * PREDICTOR_TICK_US * 1e-6f;
+			}
+		}
+	}
+}
+
+// state
+static T previous_action[4] = {-1, -1, -1, -1};
+static T qd_logged[4] = {1, 0, 0, 0}; // attitude relative to the target, as observed in the last observe()
+
+
+void observe(RLtoolsInferenceApplicationsL2FObservation& observation, TestObservationMode mode, uint64_t now){
+	// converting from FRD to FLU
+	T qd[4] = {1, 0, 0, 0}, Rt_inv[9];
+	if(mode >= TestObservationMode::ORIENTATION){
+		// FRD to FLU
+		// Validating Julia code:
+		// using Rotations
+		// FRD2FLU = [1 0 0; 0 -1 0; 0 0 -1]
+		// q = rand(UnitQuaternion)
+		// q2 = UnitQuaternion(q.q.s, q.q.v1, -q.q.v2, -q.q.v3)
+		// diff = q2 - FRD2FLU * q * transpose(FRD2FLU)
+		// @assert sum(abs.(diff)) < 1e-10
+
+		T qt[4], qtc[4], qr[4];
+		qt[0] = target_orientation[0]; // conjugate to build the difference between setpoint and current
+		qt[1] = target_orientation[1];
+		qt[2] = target_orientation[2];
+		qt[3] = target_orientation[3];
+		quaternion_conjugate(qt, qtc);
+		quaternion_to_rotation_matrix(qtc, Rt_inv);
+
+        quaternion_t q;
+        getQuaternion(&q);
+
+		// 2026-09-01: tried applying the documented FRD->FLU negation (y,z) here empirically
+		// on real hardware (f1.csv) -- it made things worse (motor outputs fully saturated,
+		// gyroADC[2] runaway to -1388deg/s -- a sign-flip-induced positive feedback signature),
+		// so it's not applied. 2026-10-17/21 (log26-29 against the wall-camera attitude, log31 shake test):
+		// getQuaternion() is already FLU here (yaw + = nose left, same sign as gyro z), so no conversion is needed.
+		qr[0] = q.w;
+		qr[1] = q.x;
+		qr[2] = q.y;
+		qr[3] = q.z;
+		// qr = qt * qd
+		// qd = qt' * qr
+		quaternion_multiplication(qtc, qr, qd);
+
+		observation.orientation[0] = qd[0];
+		observation.orientation[1] = qd[1];
+		observation.orientation[2] = qd[2];
+		observation.orientation[3] = qd[3];
+	}
+	else{
+		observation.orientation[0] = 1;
+		observation.orientation[1] = 0;
+		observation.orientation[2] = 0;
+		observation.orientation[3] = 0;
+	}
+	// heading frame -> target frame happens in predictor_update (rotation by the yaw of qd, the same
+	// orientation the policy sees), so position and orientation share one frame
+	predictor_update(now, qd);
+	for(TI i = 0; i < 4; i++){
+		qd_logged[i] = qd[i];
+	}
+	if(mode >= TestObservationMode::POSITION && predictor_have_estimate){
+		for(TI i = 0; i < 3; i++){
+			observation.position[i] = clip(predictor_position[i] * POSITION_OBSERVATION_GAIN, -MAX_POSITION_ERROR, MAX_POSITION_ERROR);
+			observation.linear_velocity[i] = clip(predictor_velocity[i] - target_linear_velocity[i], -MAX_LINEAR_VELOCITY_ERROR, MAX_LINEAR_VELOCITY_ERROR);
+		}
+	}
+	else{
+		for(TI i = 0; i < 3; i++){
+			observation.position[i] = 0;
+			observation.linear_velocity[i] = 0;
+		}
+	}
+	if(mode >= TestObservationMode::ANGULAR_VELOCITY){
+        
+        constexpr float GYRO_CONVERSION_FACTOR = (T)M_PI / 180.0f;
+		observation.angular_velocity[0] = gyro.gyroADCf[0] * GYRO_CONVERSION_FACTOR;
+		observation.angular_velocity[1] = gyro.gyroADCf[1] * GYRO_CONVERSION_FACTOR;
+		observation.angular_velocity[2] = gyro.gyroADCf[2] * GYRO_CONVERSION_FACTOR;
+	}
+	else{
+		observation.angular_velocity[0] = 0;
+		observation.angular_velocity[1] = 0;
+		observation.angular_velocity[2] = 0;
+	}
+	for(int action_i=0; action_i < RL_TOOLS_INTERFACE_APPLICATIONS_L2F_ACTION_DIM; action_i++){
+		observation.previous_action[action_i] = previous_action[action_i];
+	}
+}
+void reset(){
+	for(int action_i=0; action_i < RL_TOOLS_INTERFACE_APPLICATIONS_L2F_ACTION_DIM; action_i++){
+		previous_action[action_i] = -1;
+	}
+	rl_tools_inference_applications_l2f_reset();
+}
+
+
+extern "C" float rl_tools_test(void){
+	// RLtoolsInferenceApplicationsL2FAction action;
+	// float abs_diff = rl_tools_inference_applications_l2f_test(&action);
+	// printf("Checkpoint test diff: %f\n", abs_diff);
+	// for(TI output_i = 0; output_i < RL_TOOLS_INTERFACE_APPLICATIONS_L2F_ACTION_DIM; output_i++){
+	// 	printf("output[%d]: %f\n", output_i, action.action[output_i]);
+	// }
+    // return abs_diff;
+    float aux2 = rcData[5];
+    // printf("AUX2 %f\n", aux2);
+    float motor1 = motor[0];
+    printf("Motor1 %f\n", motor1);
+    return 0;
+}
+
+extern "C" void rl_tools_control(void){
+    if(first_run){
+        first_run = false;
+        printf("RLtools Inference Applications L2F Control started\n");
+        rl_tools_inference_applications_l2f_init();
+    }
+    timeUs_t now_narrow = micros();
+    if(previous_micros_set && (now_narrow < previous_micros)){
+        micros_overflow_counter++;
+    }
+    previous_micros = now_narrow;
+    uint64_t now = micros_overflow_counter * std::numeric_limits<timeUs_t>::max() + now_narrow;
+
+    float aux2 = rcData[5]; // AUX2: dedicated RAPTOR engage switch, kept separate from arm (AUX1) and angle (AUX3)
+    bool next_active = aux2 > 1750;
+    if(!active && next_active){
+        reset();
+        // hold the heading the drone has at engage instead of turning to the FC's arbitrary yaw zero
+        quaternion_t q;
+        getQuaternion(&q);
+        T qa[4] = {q.w, q.x, q.y, q.z};
+        T psi = quaternion_yaw(qa);
+        target_orientation[0] = cosf(psi / 2);
+        target_orientation[1] = 0;
+        target_orientation[2] = 0;
+        target_orientation[3] = sinf(psi / 2);
+        active_since_us = now;
+        predictor_reset(now);
+        printf("Resetting Inference Executor (Recurrent State)\n");
+    }
+    // 2026-10-21: log30 ended in a DISARM_REASON_RUNAWAY_TAKEOFF: Betaflight's own (bypassed) PID kept running,
+    // saturated while the policy flew / the drone was tilted by hand, and anti-runaway disarmed after 75 ms.
+    // Under RAPTOR the throttle stick stays low, so Betaflight never decides "in flight" and never turns that
+    // check off by itself. Pause it only while the policy is engaged; manual flying keeps it.
+    if(active != next_active){
+        runawayTakeoffTemporaryDisable(next_active ? 1 : 0);
+    }
+    active = next_active;
+    predictor_offset_update(now); // cheap (100 Hz, one rotation); must run before engage to have settled
+
+
+    // 2026-09-26: the motor write below was already gated on `active`, but observe() and the
+    // actual network inference (MLP + recurrent GRU layers) were NOT -- they ran every single
+    // loop, unconditionally, at the full ~3.2kHz control loop rate, even in plain manual mode
+    // with AUX2 off. That's real CPU/timing load sitting inside DSHOT's timing-sensitive path
+    // regardless of whether the policy is engaged. A stock-vs-custom-firmware A/B test (same
+    // hardware, same battery) showed stock flying clean and this firmware resetting/flipping in
+    // pure manual mode -- consistent with inference-induced loop jitter glitching motor timing,
+    // not a power delivery problem. Skipping the entire observation+inference path when inactive
+    // so manual mode has none of this overhead, matching stock timing, not just stock motor output.
+    if(!active){
+        return;
+    }
+
+	RLtoolsInferenceApplicationsL2FObservation observation;
+	RLtoolsInferenceApplicationsL2FAction action;
+	update_external(now);
+	observe(observation, TestObservationMode::ACTION_HISTORY, now);
+	auto executor_status = rl_tools_inference_applications_l2f_control(now*1000, &observation, &action);
+	// DEBUG_SET is a cheap array write, gated on `debugMode`; the old per-loop printf()s below
+	// were removed because printf's stdio backend is unimplemented on this board (silent no-op)
+	// yet the float formatting still ran every loop, unconditionally, at up to 400Hz.
+	// Debug 0-3 (since 2026-09-01): the orientation quaternion fed to the network (w,x,y,z, *10000). Added to check
+	// the FRD/FLU convention in a zero-thrust hand-tilt test; kept because the offline analysis of the predictor
+	// (debug 4-7 below) needs it.
+	DEBUG_SET(DEBUG_RAPTOR, 0, (int16_t)(observation.orientation[0] * (T)10000));
+	DEBUG_SET(DEBUG_RAPTOR, 1, (int16_t)(observation.orientation[1] * (T)10000));
+	DEBUG_SET(DEBUG_RAPTOR, 2, (int16_t)(observation.orientation[2] * (T)10000));
+	DEBUG_SET(DEBUG_RAPTOR, 3, (int16_t)(observation.orientation[3] * (T)10000));
+	// 2026-10-17: 4-7 were the actions (still recoverable from motor[] in the log). Now: 4-6 the raw
+	// laptop position in the target frame (mm; all 0 = no valid laptop value), 7 the predicted (delay
+	// compensated) x position the policy sees (mm). With qd (0-3) and accSmooth the whole predictor can
+	// be recomputed offline from the log, so its sign / frame / delay can be checked.
+	{
+		T psi = quaternion_yaw(qd_logged), c = cosf(psi), s = sinf(psi);
+		DEBUG_SET(DEBUG_RAPTOR, 4, (int16_t)((c * external_position[0] - s * external_position[1]) * (T)1000));
+		DEBUG_SET(DEBUG_RAPTOR, 5, (int16_t)((s * external_position[0] + c * external_position[1]) * (T)1000));
+		DEBUG_SET(DEBUG_RAPTOR, 6, (int16_t)(external_position[2] * (T)1000));
+	}
+	DEBUG_SET(DEBUG_RAPTOR, 7, (int16_t)(observation.position[0] * (T)1000));
+
+    float roll = rcData[0];
+    float pitch = rcData[1];
+    float yaw = rcData[2];
+    float throttle = rcData[3];
+    static constexpr T MANUAL_POSITION_GAIN = 0.3;
+    target_linear_velocity[0] = 0; // MANUAL_POSITION_GAIN * (pitch - 1500) / 500; // pitch
+    target_linear_velocity[1] = 0; // MANUAL_POSITION_GAIN * (roll - 1500) / 500; // roll
+    target_linear_velocity[2] = 0; // MANUAL_POSITION_GAIN * (throttle - 1500) / 500; // throttle
+
+    // 2026-09-24: log5/log6/log7 all show the same signature immediately on AUX2 engage --
+    // a motor's output climbs in lockstep with the gyro rate it should be *opposing*
+    // (positive feedback), strongest on the motor[1]/gyro[1] pair. That matches exactly what
+    // this commented-out Crazyflie->Betaflight remap was for. Re-enabling it as the next thing
+    // to test, since soft-start tuning alone (log7) changed the failure's timing, not the outcome.
+    uint8_t target_indices[4] = {1, 0, 2, 3}; // remapping from Crazyflie to Betaflight motor indices
+
+    T soft_start_scale = 1;
+    if(active){
+        uint64_t elapsed_us = now - active_since_us;
+        if(elapsed_us < (uint64_t)SOFT_START_DURATION_US){
+            T progress = (T)elapsed_us / SOFT_START_DURATION_US;
+            soft_start_scale = SOFT_START_MIN_SCALE + (1 - SOFT_START_MIN_SCALE) * progress;
+        }
+    }
+
+    // 2026-09-24 (3): this was hardcoded to a generic 1000-2000 PWM range (action*500+1500),
+    // but this board's actual configured motor output range is [158, 2047] (DSHOT-native --
+    // matches "motorOutput" in the blackbox header). 1500 as the action=0 "center" was way
+    // above this board's real midpoint (~1102).
+    // 2026-09-24 (4): the geometric midpoint (~1102) still isn't the same thing as this
+    // airframe's actual hover-neutral point -- the FC dataflash flight held together for
+    // 11+ seconds on that midpoint but drifted into a flip by ~15s, with amperage staying
+    // elevated the whole engaged period, consistent with commanding more average thrust than
+    // this airframe needs to hover.
+    // 2026-09-24 (5): first attempt at this set the center to 1200, but that was on the wrong
+    // scale -- 1200 was the rcCommand/stick figure, not a motor[] value. Measured the real
+    // motor[] average over 22s of genuinely stable manual hover in log6 (t=8-30s, well clear
+    // of the ramp-up and the eventual crash): mean was ~722, vs. stick rcCommand[3] averaging
+    // ~1297 over the same window -- two different scales that happened to both look like
+    // plausible-ish numbers, which is what caused the mixup. Using the real measured motor[]
+    // hover value here instead of a derived or guessed one.
+    const T motor_output_low = getMotorOutputLow();
+    const T motor_output_high = getMotorOutputHigh();
+    const T motor_output_center = (T)722;
+    // 2026-09-26 (5): first attempt at an asymmetric range (full 158-2047 authority instead of
+    // capping at ~1667) was reverted after it appeared to reproduce the flip+reset brownout.
+    // 2026-09-27: that reset turned out to be the battery issue, so re-applied the asymmetric
+    // range -- but log23/24/25 then showed a worse, escalating, MULTI-AXIS instability (gyro[0]
+    // roll now the dominant blown-up axis, not just yaw, growing over 9+ seconds, motors hitting
+    // the full 2047 ceiling repeatedly). The yaw clamp only covers yaw, not roll/pitch, so giving
+    // the policy the true ceiling gave this room to run unchecked on an axis with no safety net.
+    // Reverting to the symmetric ~1667 cap -- the original "can't hold altitude" report looks
+    // like this broader instability, not a thrust ceiling problem.
+    const T motor_output_range_pos = (motor_output_high - motor_output_low) / (T)2;
+    const T motor_output_range_neg = motor_output_range_pos;
+
+    // 2026-09-26 (2): hand-tilt tests (log12/log13) confirmed pitch and roll respond correctly,
+    // and the yaw hand-twist test (log17) also confirmed the *direction* is correct -- diagonal
+    // pair M1+M4 vs M2+M3 engages appropriately and mirrors for the opposite twist. But log11 and
+    // log16 both show yaw specifically going fully unstable in real flight (gyro pegging the
+    // sensor's +-2000deg/s limit), a real-dynamics instability a slow hand test can't reproduce,
+    // not a mapping bug. Since there's no single "yaw channel" in this per-motor action space --
+    // yaw is the antisymmetric diagonal component across all 4 motors -- clamping it means
+    // decomposing into the standard X-quad mixing basis (thrust/roll/pitch/yaw are orthogonal
+    // combinations of the 4 physical motor commands), capping only the yaw component, and
+    // reconstructing. This leaves thrust/roll/pitch completely untouched and puts a hard ceiling
+    // on how much diagonal-pair differential the policy can ever command, regardless of why.
+    T limited_action[RL_TOOLS_INTERFACE_APPLICATIONS_L2F_ACTION_DIM];
+    for(TI action_i = 0; action_i < RL_TOOLS_INTERFACE_APPLICATIONS_L2F_ACTION_DIM; action_i++){
+        T clipped_action = clip(action.action[action_i], (T)-1, (T)1);
+        previous_action[action_i] = clipped_action;
+        limited_action[action_i] = clip(clipped_action * soft_start_scale, (T)-1, (T)1);
+    }
+
+    if(active && ARMING_FLAG(ARMED)){
+        // remap into physical motor order (M1..M4 <-> physical index 0..3)
+        T a[4];
+        for(TI action_i = 0; action_i < 4; action_i++){
+            a[target_indices[action_i]] = limited_action[action_i];
+        }
+        // yaw basis vector on (M1,M2,M3,M4) is [+1,-1,-1,+1] (diagonal M1+M4 vs M2+M3),
+        // orthogonal to thrust[1,1,1,1], roll[1,1,-1,-1], pitch[-1,1,-1,1].
+        // 2026-09-26 (3): log17 (with MAX_YAW_RAW=1.5) showed the clamp genuinely working --
+        // motors stayed bounded, never saturated to floor/ceiling like every prior crash -- but
+        // gyro[2] still pegged the sensor's +-2000deg/s limit, because even 37.5% authority held
+        // continuously in one direction for ~1s is enough to spin it up. A flat cap only bounds
+        // peak torque, not sustained buildup. Tightening the cap further AND adding a hard,
+        // sign-independent cutoff: cross-referencing log16 and log17, commanded yaw_raw and the
+        // resulting gyro[2] consistently have OPPOSITE sign during the runaway, so a naive
+        // proportional damper risks getting that sign backwards and adding energy instead of
+        // removing it. Killing yaw authority to zero entirely above a real-rate threshold is
+        // unambiguous regardless of sign convention -- it can only remove authority, never add it.
+        // 2026-10-21 (log32): the actual cause of all the yaw runaways. The simulator's rotors spin like Betaflight's
+        // default "props in" (rotor_torque_directions FR -z, RR +z, RL -z, FL +z: +yaw_raw -> +yaw, nose left), but the
+        // Air75 flies "props out" (yaw_motors_reversed = ON; Betaflight's mixer flips its yaw sign for that, mixer.c),
+        // so on the real drone +yaw_raw turns the nose RIGHT: every yaw correction of the policy pushed the wrong way.
+        // log32: SF on, policy yaw_raw +97/+379 -> gyro z -26/-78/-113 deg/s within 60 ms (qd yaw, verified against the
+        // camera in log26-29, agrees with gyro z), then the 80 deg/s cutoff below removed all yaw authority and it spun.
+        // Fix: mirror the yaw component (diagonal difference) of the policy's command. Thrust / roll / pitch unchanged.
+        static constexpr bool PROPS_OUT = true; // must match yaw_motors_reversed
+        static constexpr T MAX_YAW_RAW = 1.0; // out of a theoretical max of +-4 (0.5 while the sign was wrong)
+        // 2026-09-26 (4): log18/19/20 show the sensor-pegging (+-2000deg/s) is gone, but yaw
+        // now sits in a sustained bang-bang oscillation right around the 250deg/s cutoff for
+        // several seconds at a stretch -- the cutoff only removes authority above threshold, it
+        // doesn't brake, so rate creeps up past 250, gets zeroed, decays, dips back under, the
+        // policy re-engages, repeat. Lowering the threshold brings that equilibrium band down
+        // proportionally -- same magnitude-only mechanism already proven safe, just earlier.
+        // 2026-10-21: with the sign fixed, yaw authority is what brakes a spin, so the cutoff is only a last-resort
+        // backstop now (80 -> 400 deg/s)
+        static constexpr T YAW_RATE_CUTOFF_DPS = 400; // real gyro yaw rate, deg/s
+        T yaw_raw = a[0] - a[1] - a[2] + a[3];
+        T yaw_clamped = clip(PROPS_OUT ? -yaw_raw : yaw_raw, -MAX_YAW_RAW, MAX_YAW_RAW);
+        T current_yaw_rate_dps = gyro.gyroADCf[2];
+        if(current_yaw_rate_dps > YAW_RATE_CUTOFF_DPS || current_yaw_rate_dps < -YAW_RATE_CUTOFF_DPS){
+            yaw_clamped = 0;
+        }
+        T delta = (yaw_clamped - yaw_raw) / (T)4;
+        a[0] += delta;
+        a[1] -= delta;
+        a[2] -= delta;
+        a[3] += delta;
+
+        for(TI motor_i = 0; motor_i < 4; motor_i++){
+            T a_clipped = clip(a[motor_i], (T)-1, (T)1);
+            T motor_output_range = a_clipped >= 0 ? motor_output_range_pos : motor_output_range_neg;
+            motor[motor_i] = clip(motor_output_center + a_clipped * motor_output_range, motor_output_low, motor_output_high);
+        }
+    }
+}

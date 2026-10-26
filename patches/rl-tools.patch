@@ -1,0 +1,1161 @@
+diff --git a/include/rl_tools/containers/matrix/operations_arm/opt.h b/include/rl_tools/containers/matrix/operations_arm/opt.h
+new file mode 100644
+index 00000000..dc374901
+--- /dev/null
++++ b/include/rl_tools/containers/matrix/operations_arm/opt.h
+@@ -0,0 +1,80 @@
++#include "../../../version.h"
++#if (defined(RL_TOOLS_DISABLE_INCLUDE_GUARDS) || !defined(RL_TOOLS_CONTAINERS_MATRIX_OPERATIONS_ARM_OPT_H)) && (RL_TOOLS_USE_THIS_VERSION == 1)
++#pragma once
++#define RL_TOOLS_CONTAINERS_MATRIX_OPERATIONS_ARM_OPT_H
++
++#include "../../../containers/matrix/operations_generic.h"
++#include "../../../devices/arm.h"
++
++RL_TOOLS_NAMESPACE_WRAPPER_START
++namespace rl_tools{
++    // Fast replacement for the generic get()/set()-per-element matrix_multiply_accumulate
++    // (containers/matrix/operations_generic.h), mirroring the pointer-walk/unroll approach
++    // already used for dense layers (nn/layers/dense/operations_arm/opt.h).
++    //
++    // Restricted (via static_assert, not a silent fallback) to the memory layout that
++    // nn::layers::gru::helper::matrix_multiply_transpose_bias(_accumulate) actually produces:
++    //   A: contraction dimension contiguous (COL_PITCH == 1)   -- e.g. an input/state row
++    //   B: contraction dimension contiguous (ROW_PITCH == 1)   -- e.g. a weight matrix permuted/transposed
++    //      into a [K x N] view, where walking the original weight row (a fixed output unit's
++    //      weights) is a stride-1 walk
++    //   output: COL_PITCH == 1, pre-populated with the bias (accumulated onto, not overwritten)
++    template<typename DEV_SPEC, typename SPEC_1, typename SPEC_2, typename SPEC_OUT>
++    void multiply_accumulate(devices::arm::OPT<DEV_SPEC>& device, const Matrix<SPEC_1>& A, const Matrix<SPEC_2>& B, Matrix<SPEC_OUT>& output){
++        static_assert(SPEC_1::COL_PITCH == 1, "ARM fast path requires A's contraction dimension to be contiguous");
++        static_assert(SPEC_2::ROW_PITCH == 1, "ARM fast path requires B's contraction dimension to be contiguous");
++        static_assert(SPEC_OUT::COL_PITCH == 1, "ARM fast path requires output's column dimension to be contiguous");
++        static_assert(SPEC_1::COLS == SPEC_2::ROWS, "contraction dimension mismatch");
++        static_assert(SPEC_1::ROWS == SPEC_OUT::ROWS);
++        static_assert(SPEC_2::COLS == SPEC_OUT::COLS);
++
++        using T = typename SPEC_1::T;
++        using TI = typename SPEC_1::TI;
++
++        constexpr TI ROWS = SPEC_OUT::ROWS; // batch size
++        constexpr TI COLS = SPEC_OUT::COLS; // output width (e.g. 3*HIDDEN_DIM)
++        constexpr TI K    = SPEC_1::COLS;   // contraction dim (e.g. INPUT_DIM / HIDDEN_DIM)
++
++        const T *a_row = A._data;
++        T *out_row = output._data;
++
++        TI row_i = ROWS;
++        while(row_i > 0U){
++            const T *b_col = B._data;
++            T *out_element = out_row;
++
++            TI col_i = COLS;
++            while(col_i > 0U){
++                const T *a_element = a_row;
++                const T *b_element = b_col;
++                T acc = *out_element; // pre-populated with bias by the caller
++
++                TI k = K >> 2U;
++                while(k > 0U){
++                    acc += a_element[0] * b_element[0];
++                    acc += a_element[1] * b_element[1];
++                    acc += a_element[2] * b_element[2];
++                    acc += a_element[3] * b_element[3];
++                    a_element += 4;
++                    b_element += 4;
++                    k--;
++                }
++                TI k_remainder = K % 0x4U;
++                while(k_remainder > 0U){
++                    acc += *a_element++ * *b_element++;
++                    k_remainder--;
++                }
++
++                *out_element++ = acc;
++                b_col += SPEC_2::COL_PITCH;
++                col_i--;
++            }
++            a_row += SPEC_1::ROW_PITCH;
++            out_row += SPEC_OUT::ROW_PITCH;
++            row_i--;
++        }
++    }
++}
++RL_TOOLS_NAMESPACE_WRAPPER_END
++
++#endif
+diff --git a/include/rl_tools/containers/matrix/operations_generic.h b/include/rl_tools/containers/matrix/operations_generic.h
+index c64700fd..3a9fcd0f 100644
+--- a/include/rl_tools/containers/matrix/operations_generic.h
++++ b/include/rl_tools/containers/matrix/operations_generic.h
+@@ -118,19 +118,19 @@ void free(DEVICE& device, matrix::MatrixStatic<T, TI, SIZE>& matrix) {
+ #endif
+ 
+     template<typename SPEC>
+-    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI rows(const Matrix<SPEC>& m){
++    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI rows(const Matrix<SPEC>&){
+         return SPEC::ROWS;
+     }
+     template<typename SPEC>
+-    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI cols(const Matrix<SPEC>& m){
++    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI cols(const Matrix<SPEC>&){
+         return SPEC::COLS;
+     }
+     template<typename SPEC>
+-    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI row_pitch(const Matrix<SPEC>& m){
++    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI row_pitch(const Matrix<SPEC>&){
+         return SPEC::ROW_PITCH;
+     }
+     template<typename SPEC>
+-    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI col_pitch(const Matrix<SPEC>& m){
++    RL_TOOLS_FUNCTION_PLACEMENT constexpr typename SPEC::TI col_pitch(const Matrix<SPEC>&){
+         return SPEC::COL_PITCH;
+     }
+ 
+diff --git a/include/rl_tools/rl/environments/l2f/multirotor.h b/include/rl_tools/rl/environments/l2f/multirotor.h
+index d03942ca..6dc96e20 100644
+--- a/include/rl_tools/rl/environments/l2f/multirotor.h
++++ b/include/rl_tools/rl/environments/l2f/multirotor.h
+@@ -412,6 +412,40 @@ namespace rl_tools::rl::environments::l2f{
+             static constexpr TI CURRENT_DIM = 3;
+             static constexpr TI DIM = NEXT_COMPONENT::DIM + CURRENT_DIM;
+         };
++        // position / linear velocity as delivered by the off-board tracker (see StateExternalPose), or the on-board
++        // delay-compensated estimate if CONFIG::PREDICT; never privileged
++        template <typename T_T, typename T_TI, typename T_NEXT_COMPONENT = LastComponent<T_TI>>
++        struct PositionExternalSpecification{
++            using T = T_T;
++            using TI = T_TI;
++            using NEXT_COMPONENT = T_NEXT_COMPONENT;
++            static constexpr bool PRIVILEGED = false;
++        };
++        template <typename SPEC>
++        struct PositionExternal{
++            using T = typename SPEC::T;
++            using TI = typename SPEC::TI;
++            using NEXT_COMPONENT = typename SPEC::NEXT_COMPONENT;
++            static constexpr bool PRIVILEGED = false;
++            static constexpr TI CURRENT_DIM = 3;
++            static constexpr TI DIM = NEXT_COMPONENT::DIM + CURRENT_DIM;
++        };
++        template <typename T_T, typename T_TI, typename T_NEXT_COMPONENT = LastComponent<T_TI>>
++        struct LinearVelocityExternalSpecification{
++            using T = T_T;
++            using TI = T_TI;
++            using NEXT_COMPONENT = T_NEXT_COMPONENT;
++            static constexpr bool PRIVILEGED = false;
++        };
++        template <typename SPEC>
++        struct LinearVelocityExternal{
++            using T = typename SPEC::T;
++            using TI = typename SPEC::TI;
++            using NEXT_COMPONENT = typename SPEC::NEXT_COMPONENT;
++            static constexpr bool PRIVILEGED = false;
++            static constexpr TI CURRENT_DIM = 3;
++            static constexpr TI DIM = NEXT_COMPONENT::DIM + CURRENT_DIM;
++        };
+         template <typename T_T, typename T_TI, typename T_NEXT_COMPONENT = LastComponent<T_TI>>
+         struct PoseIntegralSpecification {
+             using T = T_T;
+@@ -621,6 +655,60 @@ namespace rl_tools::rl::environments::l2f{
+         T angular_velocity_history[HISTORY_MEM_LENGTH][3];
+     };
+ 
++    // Position and velocity as an off-board tracker delivers them (wall-ArUco camera -> laptop -> radio):
++    // camera frames every CONFIG::CAMERA_PERIOD steps with position noise; velocity is a low-passed finite
++    // difference of those frames (time constant CONFIG::VELOCITY_TAU); then a delay sampled per episode
++    // (CONFIG::DELAY_MIN..DELAY_MAX steps) and a radio that passes a new value only every CONFIG::RADIO_PERIOD steps.
++    // Read by observation::PositionExternal / observation::LinearVelocityExternal.
++    template <typename T_T, typename T_TI, typename T_CONFIG, typename T_NEXT_COMPONENT>
++    struct StateExternalPoseSpecification{
++        using T = T_T;
++        using TI = T_TI;
++        using CONFIG = T_CONFIG;
++        using NEXT_COMPONENT = T_NEXT_COMPONENT;
++    };
++    template <typename T_SPEC>
++    struct StateExternalPose: T_SPEC::NEXT_COMPONENT{
++        using SPEC = T_SPEC;
++        using T = typename SPEC::T;
++        using TI = typename SPEC::TI;
++        using CONFIG = typename SPEC::CONFIG;
++        using NEXT_COMPONENT = typename SPEC::NEXT_COMPONENT;
++        static constexpr bool REQUIRES_INTEGRATION = false;
++        static constexpr TI DIM = NEXT_COMPONENT::DIM; // not part of the minimal state
++        static constexpr TI HISTORY_LENGTH_TRACKER = CONFIG::DELAY_MAX + CONFIG::RADIO_PERIOD + 1;
++        static constexpr TI HISTORY_LENGTH_PREDICTOR = CONFIG::ASSUMED_DELAY + CONFIG::VELOCITY_EXTRA_AGE + 2;
++        static constexpr TI HISTORY_LENGTH = HISTORY_LENGTH_TRACKER > HISTORY_LENGTH_PREDICTOR ? HISTORY_LENGTH_TRACKER : HISTORY_LENGTH_PREDICTOR;
++        T position_history[HISTORY_LENGTH][3]; // tracker output (held between camera frames), indexed by step % HISTORY_LENGTH
++        T velocity_history[HISTORY_LENGTH][3];
++        // CONFIG::PREDICT: on-board delay compensation as the firmware does it: world-frame acceleration from the
++        // accelerometer (with bias + noise) integrated forward from each (old) tracker value
++        T accel_history[HISTORY_LENGTH][3];
++        T accel_bias[3];
++        T accel_bias_estimate[3]; // CONFIG::ACCEL_BIAS_TAU > 0: the firmware's slow running mean of the measured acceleration
++        T estimated_position[3];
++        T estimated_velocity[3];
++        T camera_position[3];
++        T camera_velocity[3];
++        T noise_scale;
++        TI step;
++        TI delay;
++        TI camera_phase;
++        TI radio_phase;
++        // CONFIG::DROPOUTS (see the post-training environment.h)
++        T drop_probability, burst_start_probability, burst_end_probability, bad_fix_probability;
++        bool camera_burst;
++        TI camera_frame_step;                       // step of the last accepted camera frame
++        TI frame_step_history[HISTORY_LENGTH];      // camera_frame_step as of that step (sender side)
++        bool radio_valid;                           // what the drone sees on the radio (held between radio updates)
++        TI radio_frame_step;                        // frame step of the newest value the drone has received
++        TI radio_new_step;                          // step at which that value arrived (heartbeat change)
++        bool estimate_valid;                        // policy.cpp predictor_have_estimate
++        TI estimate_valid_step;                     // last step with a valid radio value (dead-reckoning start)
++        T radio_position[3];                        // newest value the drone has received (held between updates)
++        T radio_velocity[3];
++    };
++
+     template <typename T_T, typename T_TI, bool T_CLOSED_FORM = false, typename T_NEXT_COMPONENT = void>
+     struct StateRotorsSpecification{
+         using T = T_T;
+diff --git a/include/rl_tools/rl/environments/l2f/operations_cpu.h b/include/rl_tools/rl/environments/l2f/operations_cpu.h
+index 6a172bb9..4450d671 100644
+--- a/include/rl_tools/rl/environments/l2f/operations_cpu.h
++++ b/include/rl_tools/rl/environments/l2f/operations_cpu.h
+@@ -73,6 +73,16 @@ namespace rl_tools{
+         return std::string(first ? "" : ".") + "AngularVelocityDelayed(" + std::to_string(OBS_SPEC::DELAY) + ")" + rl::environments::l2f::obs_helper::dispatch(device, env, typename OBSERVATION::NEXT_COMPONENT{}, false);
+     }
+     template <typename DEVICE, typename SPEC, typename OBS_SPEC>
++    std::string string(DEVICE& device, const rl::environments::Multirotor<SPEC>& env, const rl::environments::l2f::observation::PositionExternal<OBS_SPEC>& obs, bool first = true){
++        using OBSERVATION = rl::environments::l2f::observation::PositionExternal<OBS_SPEC>;
++        return std::string(first ? "" : ".") + "PositionExternal" + rl::environments::l2f::obs_helper::dispatch(device, env, typename OBSERVATION::NEXT_COMPONENT{}, false);
++    }
++    template <typename DEVICE, typename SPEC, typename OBS_SPEC>
++    std::string string(DEVICE& device, const rl::environments::Multirotor<SPEC>& env, const rl::environments::l2f::observation::LinearVelocityExternal<OBS_SPEC>& obs, bool first = true){
++        using OBSERVATION = rl::environments::l2f::observation::LinearVelocityExternal<OBS_SPEC>;
++        return std::string(first ? "" : ".") + "LinearVelocityExternal" + rl::environments::l2f::obs_helper::dispatch(device, env, typename OBSERVATION::NEXT_COMPONENT{}, false);
++    }
++    template <typename DEVICE, typename SPEC, typename OBS_SPEC>
+     std::string string(DEVICE& device, const rl::environments::Multirotor<SPEC>& env, const rl::environments::l2f::observation::PoseIntegral<OBS_SPEC>& obs, bool first = true){
+         using OBSERVATION = rl::environments::l2f::observation::PoseIntegral<OBS_SPEC>;
+         return std::string(first ? "" : ".") + "PoseIntegral" + rl::environments::l2f::obs_helper::dispatch(device, env, typename OBSERVATION::NEXT_COMPONENT{}, false);
+diff --git a/include/rl_tools/rl/environments/l2f/operations_generic/20_initial_state.h b/include/rl_tools/rl/environments/l2f/operations_generic/20_initial_state.h
+index 89ad932b..78558eb9 100644
+--- a/include/rl_tools/rl/environments/l2f/operations_generic/20_initial_state.h
++++ b/include/rl_tools/rl/environments/l2f/operations_generic/20_initial_state.h
+@@ -63,6 +63,49 @@ namespace rl_tools{
+             }
+         }
+         template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC>
++        static void _initial_state(DEVICE& device, rl::environments::Multirotor<SPEC>& env, PARAMETERS& parameters, rl::environments::l2f::StateExternalPose<STATE_SPEC>& state){
++            using TI = typename DEVICE::index_t;
++            using STATE = rl::environments::l2f::StateExternalPose<STATE_SPEC>;
++            using CONFIG = typename STATE::CONFIG;
++            initial_state(device, env, parameters, static_cast<typename STATE_SPEC::NEXT_COMPONENT&>(state));
++            for (TI dim_i=0; dim_i < 3; dim_i++){
++                state.camera_position[dim_i] = state.position[dim_i];
++                state.camera_velocity[dim_i] = state.linear_velocity[dim_i];
++                for (TI step_i=0; step_i < STATE::HISTORY_LENGTH; step_i++){
++                    state.position_history[step_i][dim_i] = state.position[dim_i];
++                    state.velocity_history[step_i][dim_i] = state.linear_velocity[dim_i];
++                    state.accel_history[step_i][dim_i] = 0;
++                }
++                state.estimated_position[dim_i] = state.position[dim_i];
++                state.estimated_velocity[dim_i] = state.linear_velocity[dim_i];
++                state.accel_bias[dim_i] = 0;
++                state.accel_bias_estimate[dim_i] = 0;
++            }
++            state.noise_scale = 1;
++            state.step = 0;
++            state.delay = (CONFIG::DELAY_MIN + CONFIG::DELAY_MAX) / 2;
++            state.camera_phase = 0;
++            state.radio_phase = 0;
++            state.drop_probability = 0;
++            state.burst_start_probability = 0;
++            state.burst_end_probability = 1;
++            state.bad_fix_probability = 0;
++            state.camera_burst = false;
++            state.camera_frame_step = 0;
++            for (TI step_i=0; step_i < STATE::HISTORY_LENGTH; step_i++){
++                state.frame_step_history[step_i] = 0;
++            }
++            state.radio_valid = true;
++            state.radio_frame_step = 0;
++            state.radio_new_step = 0;
++            state.estimate_valid = true;
++            state.estimate_valid_step = 0;
++            for (TI dim_i=0; dim_i < 3; dim_i++){
++                state.radio_position[dim_i] = state.position[dim_i];
++                state.radio_velocity[dim_i] = state.linear_velocity[dim_i];
++            }
++        }
++        template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC>
+         static void _initial_state(DEVICE& device, rl::environments::Multirotor<SPEC>& env, PARAMETERS& parameters, rl::environments::l2f::StatePoseErrorIntegral<STATE_SPEC>& state){
+             using TI = typename DEVICE::index_t;
+             initial_state(device, env, parameters, static_cast<typename STATE_SPEC::NEXT_COMPONENT&>(state));
+diff --git a/include/rl_tools/rl/environments/l2f/operations_generic/30_sample_initial_state.h b/include/rl_tools/rl/environments/l2f/operations_generic/30_sample_initial_state.h
+index 9220aaf0..f22380ae 100644
+--- a/include/rl_tools/rl/environments/l2f/operations_generic/30_sample_initial_state.h
++++ b/include/rl_tools/rl/environments/l2f/operations_generic/30_sample_initial_state.h
+@@ -112,6 +112,64 @@ namespace rl_tools{
+             }
+         }
+         template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC, typename RNG>
++        RL_TOOLS_FUNCTION_PLACEMENT static void _sample_initial_state(DEVICE& device, Multirotor<SPEC>& env, PARAMETERS& parameters, StateExternalPose<STATE_SPEC>& state, RNG& rng){
++            using T = typename SPEC::T;
++            using TI = typename DEVICE::index_t;
++            using STATE = StateExternalPose<STATE_SPEC>;
++            using CONFIG = typename STATE::CONFIG;
++            sample_initial_state(device, env, parameters, static_cast<typename STATE_SPEC::NEXT_COMPONENT&>(state), rng);
++            for (TI dim_i=0; dim_i < 3; dim_i++){
++                state.camera_position[dim_i] = state.position[dim_i];
++                state.camera_velocity[dim_i] = state.linear_velocity[dim_i];
++                for (TI step_i=0; step_i < STATE::HISTORY_LENGTH; step_i++){
++                    state.position_history[step_i][dim_i] = state.position[dim_i];
++                    state.velocity_history[step_i][dim_i] = state.linear_velocity[dim_i];
++                    state.accel_history[step_i][dim_i] = 0;
++                }
++                state.estimated_position[dim_i] = state.position[dim_i];
++                state.estimated_velocity[dim_i] = state.linear_velocity[dim_i];
++                state.accel_bias[dim_i] = 0;
++                state.accel_bias_estimate[dim_i] = 0;
++            }
++            state.noise_scale = random::uniform_real_distribution(device.random, (T)CONFIG::NOISE_SCALE_MIN, (T)CONFIG::NOISE_SCALE_MAX, rng);
++            for (TI dim_i=0; dim_i < 3; dim_i++){
++                const T bias_max = dim_i < 2 ? (T)CONFIG::ACCEL_BIAS_MAX_XY : (T)CONFIG::ACCEL_BIAS_MAX_Z;
++                state.accel_bias[dim_i] = random::uniform_real_distribution(device.random, -bias_max, bias_max, rng);
++                // the firmware starts its estimate from the acceleration measured at engage (drone roughly still)
++                state.accel_bias_estimate[dim_i] = state.accel_bias[dim_i] + random::normal_distribution::sample(device.random, (T)0, (T)CONFIG::ACCEL_BIAS_INIT_ERROR, rng);
++            }
++            state.step = 0;
++            state.delay = random::uniform_int_distribution(device.random, (TI)CONFIG::DELAY_MIN, (TI)CONFIG::DELAY_MAX, rng);
++            state.camera_phase = random::uniform_int_distribution(device.random, (TI)0, (TI)(CONFIG::CAMERA_PERIOD - 1), rng);
++            state.radio_phase = random::uniform_int_distribution(device.random, (TI)0, (TI)(CONFIG::RADIO_PERIOD - 1), rng);
++            state.drop_probability = 0;
++            state.burst_start_probability = 0;
++            state.burst_end_probability = 1;
++            state.bad_fix_probability = 0;
++            if constexpr(CONFIG::DROPOUTS){
++                const T frame_dt = CONFIG::CAMERA_PERIOD * parameters.integration.dt;
++                state.drop_probability = random::uniform_real_distribution(device.random, (T)0, (T)CONFIG::DROP_MAX, rng);
++                state.burst_start_probability = random::uniform_real_distribution(device.random, (T)0, (T)CONFIG::BURST_START_MAX, rng);
++                T burst_mean = random::uniform_real_distribution(device.random, (T)CONFIG::BURST_MIN, (T)CONFIG::BURST_MAX, rng);
++                state.burst_end_probability = math::min(typename DEVICE::SPEC::MATH{}, frame_dt / burst_mean, (T)1);
++                state.bad_fix_probability = random::uniform_real_distribution(device.random, (T)0, (T)CONFIG::BAD_FIX_PROB_MAX, rng);
++            }
++            state.camera_burst = false;
++            state.camera_frame_step = 0;
++            for (TI step_i=0; step_i < STATE::HISTORY_LENGTH; step_i++){
++                state.frame_step_history[step_i] = 0;
++            }
++            state.radio_valid = true;
++            state.radio_frame_step = 0;
++            state.radio_new_step = 0;
++            state.estimate_valid = true;
++            state.estimate_valid_step = 0;
++            for (TI dim_i=0; dim_i < 3; dim_i++){
++                state.radio_position[dim_i] = state.position[dim_i];
++                state.radio_velocity[dim_i] = state.linear_velocity[dim_i];
++            }
++        }
++        template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC, typename RNG>
+         RL_TOOLS_FUNCTION_PLACEMENT static void _sample_initial_state(DEVICE& device, Multirotor<SPEC>& env, PARAMETERS& parameters, StatePoseErrorIntegral<STATE_SPEC>& state, RNG& rng){
+             using TI = typename DEVICE::index_t;
+             sample_initial_state(device, env, parameters, static_cast<typename STATE_SPEC::NEXT_COMPONENT&>(state), rng);
+diff --git a/include/rl_tools/rl/environments/l2f/operations_generic/40_observe.h b/include/rl_tools/rl/environments/l2f/operations_generic/40_observe.h
+index e868b770..9b093b79 100644
+--- a/include/rl_tools/rl/environments/l2f/operations_generic/40_observe.h
++++ b/include/rl_tools/rl/environments/l2f/operations_generic/40_observe.h
+@@ -217,6 +217,57 @@ namespace rl_tools{
+             auto next_observation = view(device, observation, matrix::ViewSpec<1, OBS_SPEC::COLS - OBSERVATION::CURRENT_DIM>{}, 0, OBSERVATION::CURRENT_DIM);
+             observe(device, env, parameters, state, typename OBSERVATION::NEXT_COMPONENT{}, next_observation, rng);
+         }
++        template<typename DEVICE, typename STATE_SPEC>
++        RL_TOOLS_FUNCTION_PLACEMENT static typename DEVICE::index_t _external_pose_slot(DEVICE& device, const StateExternalPose<STATE_SPEC>& state){
++            // the radio passes a new value every RADIO_PERIOD steps; that value is `delay` steps old when it is sent
++            using TI = typename DEVICE::index_t;
++            using STATE = StateExternalPose<STATE_SPEC>;
++            using CONFIG = typename STATE::CONFIG;
++            TI age = state.delay + (state.step + state.radio_phase) % CONFIG::RADIO_PERIOD;
++            static_assert(CONFIG::DELAY_MAX + CONFIG::RADIO_PERIOD - 1 < STATE::HISTORY_LENGTH);
++            return (state.step + STATE::HISTORY_LENGTH - age) % STATE::HISTORY_LENGTH; // slots before step 0 hold the initial value
++        }
++        template<typename DEVICE, typename SPEC, typename STATE_SPEC, typename OBS_SPEC>
++        RL_TOOLS_FUNCTION_PLACEMENT static void _observe_external_pose(DEVICE& device, const Multirotor<SPEC>& env, const StateExternalPose<STATE_SPEC>& state, bool velocity, Matrix<OBS_SPEC>& observation){
++            using TI = typename DEVICE::index_t;
++            using CONFIG = typename StateExternalPose<STATE_SPEC>::CONFIG;
++            using T = typename STATE_SPEC::T;
++            if constexpr(CONFIG::PREDICT){
++                for(TI i = 0; i < 3; i++){
++                    T value = velocity ? state.estimated_velocity[i] : state.estimated_position[i] * (T)CONFIG::POSITION_GAIN;
++                    if constexpr(CONFIG::DROPOUTS){
++                        // policy.cpp: zeros without an estimate, otherwise clipped to the radio range
++                        const T limit = velocity ? (T)CONFIG::MAX_LINEAR_VELOCITY_ERROR : (T)CONFIG::MAX_POSITION_ERROR;
++                        value = state.estimate_valid ? math::clamp(typename DEVICE::SPEC::MATH{}, value, -limit, limit) : (T)0;
++                    }
++                    set(observation, 0, i, value);
++                }
++            }
++            else{
++                TI slot = _external_pose_slot(device, state);
++                for(TI i = 0; i < 3; i++){
++                    set(observation, 0, i, velocity ? state.velocity_history[slot][i] : state.position_history[slot][i]);
++                }
++            }
++        }
++        template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE, typename OBSERVATION_SPEC, typename OBS_SPEC, typename RNG>
++        RL_TOOLS_FUNCTION_PLACEMENT static void _observe(DEVICE& device, const Multirotor<SPEC>& env, PARAMETERS& parameters, const STATE& state, observation::PositionExternal<OBSERVATION_SPEC>, Matrix<OBS_SPEC>& observation, RNG& rng){
++            using OBSERVATION = observation::PositionExternal<OBSERVATION_SPEC>;
++            static_assert(OBS_SPEC::COLS >= OBSERVATION::CURRENT_DIM);
++            static_assert(OBS_SPEC::ROWS == 1);
++            _observe_external_pose(device, env, state, false, observation);
++            auto next_observation = view(device, observation, matrix::ViewSpec<1, OBS_SPEC::COLS - OBSERVATION::CURRENT_DIM>{}, 0, OBSERVATION::CURRENT_DIM);
++            observe(device, env, parameters, state, typename OBSERVATION::NEXT_COMPONENT{}, next_observation, rng);
++        }
++        template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE, typename OBSERVATION_SPEC, typename OBS_SPEC, typename RNG>
++        RL_TOOLS_FUNCTION_PLACEMENT static void _observe(DEVICE& device, const Multirotor<SPEC>& env, PARAMETERS& parameters, const STATE& state, observation::LinearVelocityExternal<OBSERVATION_SPEC>, Matrix<OBS_SPEC>& observation, RNG& rng){
++            using OBSERVATION = observation::LinearVelocityExternal<OBSERVATION_SPEC>;
++            static_assert(OBS_SPEC::COLS >= OBSERVATION::CURRENT_DIM);
++            static_assert(OBS_SPEC::ROWS == 1);
++            _observe_external_pose(device, env, state, true, observation);
++            auto next_observation = view(device, observation, matrix::ViewSpec<1, OBS_SPEC::COLS - OBSERVATION::CURRENT_DIM>{}, 0, OBSERVATION::CURRENT_DIM);
++            observe(device, env, parameters, state, typename OBSERVATION::NEXT_COMPONENT{}, next_observation, rng);
++        }
+         template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC, typename OBSERVATION_SPEC, typename OBS_SPEC, typename RNG>
+         RL_TOOLS_FUNCTION_PLACEMENT static void _observe_angular_velocity_delayed(DEVICE& device, const Multirotor<SPEC>& env, PARAMETERS& parameters, const StateAngularVelocityDelay<STATE_SPEC>& state, observation::AngularVelocityDelayed<OBSERVATION_SPEC>, Matrix<OBS_SPEC>& observation, RNG& rng){
+             // this function is separate such that we can extract the angular velocity state from the generic state
+diff --git a/include/rl_tools/rl/environments/l2f/operations_generic/70_post_integration.h b/include/rl_tools/rl/environments/l2f/operations_generic/70_post_integration.h
+index 0f116827..bcbecded 100644
+--- a/include/rl_tools/rl/environments/l2f/operations_generic/70_post_integration.h
++++ b/include/rl_tools/rl/environments/l2f/operations_generic/70_post_integration.h
+@@ -79,6 +79,181 @@ namespace rl_tools::rl::environments::l2f{
+             }
+         }
+     }
++    template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC, typename ACTION_SPEC, typename RNG>
++    RL_TOOLS_FUNCTION_PLACEMENT void post_integration(DEVICE& device, const Multirotor<SPEC>& env, PARAMETERS& parameters, const StateExternalPose<STATE_SPEC>& state, const Matrix<ACTION_SPEC>& action, StateExternalPose<STATE_SPEC>& next_state, RNG& rng) {
++        using T = typename STATE_SPEC::T;
++        using TI = typename DEVICE::index_t;
++        using STATE = StateExternalPose<STATE_SPEC>;
++        using CONFIG = typename STATE::CONFIG;
++        post_integration(device, env, parameters, static_cast<const typename STATE_SPEC::NEXT_COMPONENT&>(state), action, static_cast<typename STATE_SPEC::NEXT_COMPONENT&>(next_state), rng);
++        for(TI step_i = 0; step_i < STATE::HISTORY_LENGTH; step_i++){
++            for(TI dim_i = 0; dim_i < 3; dim_i++){
++                next_state.position_history[step_i][dim_i] = state.position_history[step_i][dim_i];
++                next_state.velocity_history[step_i][dim_i] = state.velocity_history[step_i][dim_i];
++                next_state.accel_history[step_i][dim_i] = state.accel_history[step_i][dim_i];
++            }
++        }
++        for(TI dim_i = 0; dim_i < 3; dim_i++){
++            next_state.accel_bias[dim_i] = state.accel_bias[dim_i];
++            if constexpr(CONFIG::ACCEL_BIAS_DRIFT > 0){
++                const T bias_max = dim_i < 2 ? (T)CONFIG::ACCEL_BIAS_MAX_XY : (T)CONFIG::ACCEL_BIAS_MAX_Z;
++                next_state.accel_bias[dim_i] = math::clamp(typename DEVICE::SPEC::MATH{}, state.accel_bias[dim_i] + random::normal_distribution::sample(device.random, (T)0, (T)CONFIG::ACCEL_BIAS_DRIFT * math::sqrt(typename DEVICE::SPEC::MATH{}, parameters.integration.dt), rng), -bias_max, bias_max);
++            }
++            next_state.accel_bias_estimate[dim_i] = state.accel_bias_estimate[dim_i];
++            next_state.camera_position[dim_i] = state.camera_position[dim_i];
++            next_state.camera_velocity[dim_i] = state.camera_velocity[dim_i];
++        }
++        next_state.noise_scale = state.noise_scale;
++        next_state.delay = state.delay;
++        next_state.camera_phase = state.camera_phase;
++        next_state.radio_phase = state.radio_phase;
++        next_state.drop_probability = state.drop_probability;
++        next_state.burst_start_probability = state.burst_start_probability;
++        next_state.burst_end_probability = state.burst_end_probability;
++        next_state.bad_fix_probability = state.bad_fix_probability;
++        next_state.camera_burst = state.camera_burst;
++        next_state.camera_frame_step = state.camera_frame_step;
++        for(TI step_i = 0; step_i < STATE::HISTORY_LENGTH; step_i++){
++            next_state.frame_step_history[step_i] = state.frame_step_history[step_i];
++        }
++        next_state.radio_valid = state.radio_valid;
++        next_state.radio_frame_step = state.radio_frame_step;
++        next_state.radio_new_step = state.radio_new_step;
++        next_state.estimate_valid = state.estimate_valid;
++        next_state.estimate_valid_step = state.estimate_valid_step;
++        for(TI dim_i = 0; dim_i < 3; dim_i++){
++            next_state.radio_position[dim_i] = state.radio_position[dim_i];
++            next_state.radio_velocity[dim_i] = state.radio_velocity[dim_i];
++        }
++        next_state.step = state.step + 1;
++        if((next_state.step + state.camera_phase) % CONFIG::CAMERA_PERIOD == 0){
++            // new camera frame: noisy position, velocity = low-passed difference to the previous frame (room_pose.py Velocity)
++            bool accepted = true, bad_fix = false;
++            if constexpr(CONFIG::DROPOUTS){
++                const T u = random::uniform_real_distribution(device.random, (T)0, (T)1, rng);
++                next_state.camera_burst = state.camera_burst ? u >= state.burst_end_probability : u < state.burst_start_probability;
++                accepted = !next_state.camera_burst && random::uniform_real_distribution(device.random, (T)0, (T)1, rng) >= state.drop_probability;
++                bad_fix = accepted && random::uniform_real_distribution(device.random, (T)0, (T)1, rng) < state.bad_fix_probability;
++            }
++            if(accepted){
++                const TI gap = next_state.step - state.camera_frame_step;
++                const T frame_dt = (CONFIG::DROPOUTS ? gap : CONFIG::CAMERA_PERIOD) * parameters.integration.dt;
++                const T alpha = frame_dt / ((T)CONFIG::VELOCITY_TAU + frame_dt);
++                const bool velocity_restart = CONFIG::DROPOUTS && gap > CONFIG::VELOCITY_RESTART_GAP;
++                const T noise_std[3] = {(T)CONFIG::POSITION_NOISE_FORWARD, (T)CONFIG::POSITION_NOISE_LATERAL, (T)CONFIG::POSITION_NOISE_LATERAL};
++                T offset[3] = {0, 0, 0};
++                if(bad_fix){
++                    // a wrong pose that room_pose.py's jump filter lets through: random direction, 5-15 cm
++                    T norm = 0;
++                    for(TI dim_i = 0; dim_i < 3; dim_i++){
++                        offset[dim_i] = random::normal_distribution::sample(device.random, (T)0, (T)1, rng);
++                        norm += offset[dim_i] * offset[dim_i];
++                    }
++                    const T magnitude = random::uniform_real_distribution(device.random, (T)CONFIG::BAD_FIX_MIN, (T)CONFIG::BAD_FIX_MAX, rng);
++                    norm = math::sqrt(typename DEVICE::SPEC::MATH{}, norm) + (T)1e-6;
++                    for(TI dim_i = 0; dim_i < 3; dim_i++){
++                        offset[dim_i] *= magnitude / norm;
++                    }
++                }
++                for(TI dim_i = 0; dim_i < 3; dim_i++){
++                    T measured = next_state.position[dim_i] + offset[dim_i] + random::normal_distribution::sample(device.random, (T)0, state.noise_scale * noise_std[dim_i], rng);
++                    T raw_velocity = (measured - state.camera_position[dim_i]) / frame_dt;
++                    next_state.camera_velocity[dim_i] = velocity_restart ? 0 : (1 - alpha) * state.camera_velocity[dim_i] + alpha * raw_velocity;
++                    next_state.camera_position[dim_i] = measured;
++                }
++                next_state.camera_frame_step = next_state.step;
++            }
++        }
++        TI slot = next_state.step % STATE::HISTORY_LENGTH;
++        for(TI dim_i = 0; dim_i < 3; dim_i++){
++            next_state.position_history[slot][dim_i] = next_state.camera_position[dim_i];
++            next_state.velocity_history[slot][dim_i] = next_state.camera_velocity[dim_i];
++        }
++        next_state.frame_step_history[slot] = next_state.camera_frame_step;
++        if constexpr(CONFIG::PREDICT){
++            const T dt = parameters.integration.dt;
++            const TI n = next_state.step;
++            const TI H = STATE::HISTORY_LENGTH;
++            for(TI dim_i = 0; dim_i < 3; dim_i++){
++                T accel = (next_state.linear_velocity[dim_i] - state.linear_velocity[dim_i]) / dt;
++                T measured = accel + state.accel_bias[dim_i] + random::normal_distribution::sample(device.random, (T)0, (T)CONFIG::ACCEL_NOISE, rng);
++                if constexpr(CONFIG::ACCEL_BIAS_TAU > 0){
++                    next_state.accel_bias_estimate[dim_i] = state.accel_bias_estimate[dim_i] + (measured - state.accel_bias_estimate[dim_i]) * dt / (T)CONFIG::ACCEL_BIAS_TAU;
++                    measured -= next_state.accel_bias_estimate[dim_i];
++                }
++                if constexpr(!CONFIG::PREDICT_ACCEL){
++                    measured = 0;
++                }
++                next_state.accel_history[n % H][dim_i] = measured;
++            }
++            const bool radio_tick = (n + state.radio_phase) % CONFIG::RADIO_PERIOD == 0;
++            bool new_value = radio_tick, valid = true;
++            if(radio_tick){
++                const TI tracker_slot = (n + H - state.delay) % H;
++                if constexpr(CONFIG::DROPOUTS){
++                    // the laptop sends each accepted frame once (heartbeat change) and "no fix" after SENDER_HOLD steps
++                    // without one; the radio repeats the last value in between
++                    const TI sender_step = n > state.delay ? n - state.delay : 0;
++                    const TI frame_step = next_state.frame_step_history[tracker_slot];
++                    new_value = false;
++                    if(sender_step - frame_step > CONFIG::SENDER_HOLD){
++                        next_state.radio_valid = false;
++                    }
++                    else if(frame_step != state.radio_frame_step || !state.radio_valid){
++                        next_state.radio_valid = true;
++                        next_state.radio_frame_step = frame_step;
++                        next_state.radio_new_step = n;
++                        new_value = true;
++                    }
++                }
++                if(new_value){
++                    for(TI dim_i = 0; dim_i < 3; dim_i++){
++                        next_state.radio_position[dim_i] = next_state.position_history[tracker_slot][dim_i];
++                        next_state.radio_velocity[dim_i] = next_state.velocity_history[tracker_slot][dim_i];
++                    }
++                }
++            }
++            if constexpr(CONFIG::DROPOUTS){
++                valid = next_state.radio_valid && n - next_state.radio_new_step < CONFIG::FIRMWARE_TIMEOUT;
++                if(valid){
++                    next_state.estimate_valid_step = n;
++                    if(!state.estimate_valid){
++                        new_value = true; // policy.cpp: re-predicts from the held value when it had no estimate
++                    }
++                    next_state.estimate_valid = true;
++                }
++                else if(!state.estimate_valid || n - state.estimate_valid_step >= CONFIG::DEAD_RECKON){
++                    next_state.estimate_valid = false;
++                }
++            }
++            if(valid && new_value){
++                // a new tracker value arrived; the firmware assumes it is ASSUMED_DELAY steps old (velocity older by
++                // VELOCITY_EXTRA_AGE because of the laptop's low-pass) and integrates the buffered acceleration forward
++                constexpr TI D = CONFIG::ASSUMED_DELAY;
++                constexpr TI E = CONFIG::VELOCITY_EXTRA_AGE;
++                for(TI dim_i = 0; dim_i < 3; dim_i++){
++                    T p = next_state.radio_position[dim_i];
++                    T v = next_state.radio_velocity[dim_i];
++                    static_assert(D + E < H);
++                    for(TI age = D + E - 1; age >= D; age--){ // accel_history slot for step n - age (before step 0: zeros)
++                        v += next_state.accel_history[(n + H - age) % H][dim_i] * dt;
++                    }
++                    for(TI age = D; age-- > 0;){
++                        v += next_state.accel_history[(n + H - age) % H][dim_i] * dt;
++                        p += v * dt;
++                    }
++                    next_state.estimated_position[dim_i] = p;
++                    next_state.estimated_velocity[dim_i] = v;
++                }
++            }
++            else{
++                for(TI dim_i = 0; dim_i < 3; dim_i++){
++                    next_state.estimated_velocity[dim_i] = state.estimated_velocity[dim_i] + next_state.accel_history[n % H][dim_i] * dt;
++                    next_state.estimated_position[dim_i] = state.estimated_position[dim_i] + next_state.estimated_velocity[dim_i] * dt;
++                }
++            }
++        }
++    }
+ //    template<typename DEVICE, typename SPEC, typename T, typename TI, typename NEXT_COMPONENT>
+ //    RL_TOOLS_FUNCTION_PLACEMENT void post_integration(DEVICE& device, const Multirotor<SPEC>& env, StateRotors<STATE_SPEC>& state) {
+     template<typename DEVICE, typename SPEC, typename PARAMETERS, typename STATE_SPEC, typename ACTION_SPEC, typename RNG>
+diff --git a/src/foundation_policy/post_training/config.h b/src/foundation_policy/post_training/config.h
+index 36ef6456..7035ae6d 100644
+--- a/src/foundation_policy/post_training/config.h
++++ b/src/foundation_policy/post_training/config.h
+@@ -4,6 +4,13 @@ struct OPTIONS_POST_TRAINING: OPTIONS_PRE_TRAINING{
+     static constexpr bool ACTION_HISTORY = true;
+     static constexpr TI ACTION_HISTORY_LENGTH = 1;
+     static constexpr bool OBSERVATION_NOISE = true;
++    static constexpr bool EXTERNAL_POSE = true; // student sees position / velocity delayed and noisy like the wall-ArUco tracker
++    static constexpr bool EXTERNAL_POSE_PREDICT = true; // ... after on-board delay compensation (firmware integrates the accelerometer forward)
++    static constexpr bool EXTERNAL_POSE_PREDICT_ACCEL = true; // false: the compensation only extrapolates with the tracker velocity
++    static constexpr bool EXTERNAL_POSE_ACCEL_REAL = true; // accelerometer offset / noise as measured in log31 instead of the 2026-10-17 guess
++    static constexpr int EXTERNAL_POSE_ACCEL_BIAS_TAU_MS = 2000; // firmware running-mean offset removal (0: none)
++    static constexpr bool EXTERNAL_POSE_DROPOUTS = true; // camera frames lost (in bursts) and bad fixes as measured in flight 2026-10-21/22
++    static constexpr int EXTERNAL_POSE_POSITION_GAIN_PCT = 100; // firmware scales the position observation by this (calmer hover < 100)
+ };
+ 
+ 
+@@ -17,7 +24,7 @@ constexpr TI SEQUENCE_LENGTH = 500;
+ constexpr TI BATCH_SIZE = 64;
+ constexpr T SOLVED_RETURN = 300;
+ constexpr TI HIDDEN_DIM = 16;
+-constexpr TI NUM_TEACHERS = 1000;
++constexpr TI NUM_TEACHERS = 300; // must match N in pre_training/sample_dynamics_parameters.cpp
+ constexpr TI NUM_ACTIVE_TEACHERS = NUM_TEACHERS;
+ constexpr TI EPOCH_TEACHER_FORCING = 10;
+ constexpr bool DYNAMIC_ALLOCATION = true;
+diff --git a/src/foundation_policy/post_training/environment.h b/src/foundation_policy/post_training/environment.h
+index de2c949f..b9ae82b9 100644
+--- a/src/foundation_policy/post_training/environment.h
++++ b/src/foundation_policy/post_training/environment.h
+@@ -20,17 +20,75 @@ namespace builder{
+             static constexpr bool OBSERVE_MOTOR_POSITIONS = OPTIONS::RANDOMIZE_MOTOR_MAPPING && OPTIONS::OBSERVE_THRASH_MARKOV;
+             static_assert(OPTIONS::ACTION_HISTORY_LENGTH >= 1);
+             static constexpr TI ANGULAR_VELOCITY_DELAY = 0; // one step at 100hz = 10ms ~ delay from IMU to input to the policy: 1.3ms time constant of the IIR in the IMU (bw ~110Hz) + synchronization delay (2ms) + (negligible SPI transfer latency due to it being interrupt-based) + 1ms sensor.c RTOS loop @ 1khz + 2ms for the RLtools loop
+-            using STATE_BASE = StateAngularVelocityDelay<StateAngularVelocityDelaySpecification<T, TI, ANGULAR_VELOCITY_DELAY, StateLastAction<StateSpecification<T, TI, StateBase<StateSpecification<T, TI>>>>>>;
++            using STATE_BASE_GYRO = StateAngularVelocityDelay<StateAngularVelocityDelaySpecification<T, TI, ANGULAR_VELOCITY_DELAY, StateLastAction<StateSpecification<T, TI, StateBase<StateSpecification<T, TI>>>>>>;
++            // Air75 with the wall-ArUco tracker: what the student sees of position / velocity (measured 2026-10-17)
++            struct EXTERNAL_POSE_CONFIG{
++                static constexpr TI CAMERA_PERIOD = 3;    // 30 fps at 100 Hz
++                static constexpr TI RADIO_PERIOD = 5;     // CH9-15 change every 50 ms at the drone
++                static constexpr TI DELAY_MIN = 9;        // video 112 ms + laptop + radio, +-40 ms margin
++                static constexpr TI DELAY_MAX = 17;
++                static constexpr double VELOCITY_TAU = 0.08;           // must match room_pose.py Velocity tau
++                static constexpr double POSITION_NOISE_FORWARD = 0.0015; // m, still drone, distance to the wall
++                static constexpr double POSITION_NOISE_LATERAL = 0.003;  // m, sideways / height
++                static constexpr double NOISE_SCALE_MIN = 0.7;
++                static constexpr double NOISE_SCALE_MAX = 2.5;
++                // on-board delay compensation (firmware policy.cpp)
++                static constexpr bool PREDICT = OPTIONS::EXTERNAL_POSE_PREDICT;
++                static constexpr TI ASSUMED_DELAY = 13;       // what the firmware assumes the tracker delay is
++                static constexpr TI VELOCITY_EXTRA_AGE = 8;   // laptop velocity low-pass tau 0.08 s
++                static constexpr bool PREDICT_ACCEL = OPTIONS::EXTERNAL_POSE_PREDICT_ACCEL; // false: constant-velocity extrapolation only
++                // EXTERNAL_POSE_ACCEL_REAL: accelerometer as measured in log31 (props-off hand test 2026-10-21): world-frame
++                // offset 0.5-2 m/s^2 drifting over seconds and growing with motor speed, noise sd 2-2.8 m/s^2 at 100 Hz
++                static constexpr double ACCEL_NOISE = OPTIONS::EXTERNAL_POSE_ACCEL_REAL ? 2.5 : 0.3; // m/s^2 per step
++                static constexpr double ACCEL_BIAS_MAX_XY = OPTIONS::EXTERNAL_POSE_ACCEL_REAL ? 2.0 : 1.0; // m/s^2
++                static constexpr double ACCEL_BIAS_MAX_Z = OPTIONS::EXTERNAL_POSE_ACCEL_REAL ? 1.6 : 0.3;
++                static constexpr double ACCEL_BIAS_DRIFT = OPTIONS::EXTERNAL_POSE_ACCEL_REAL ? 0.3 : 0; // m/s^2 per sqrt(s), random walk
++                // firmware offset removal: running mean of the world-frame acceleration with this time constant (0: none)
++                static constexpr double ACCEL_BIAS_TAU = OPTIONS::EXTERNAL_POSE_ACCEL_BIAS_TAU_MS / 1000.0;
++                static constexpr double ACCEL_BIAS_INIT_ERROR = 0.3; // running mean at engage vs the true offset
++                // EXTERNAL_POSE_DROPOUTS: in flight (2026-10-21/22 recordings) only 44% of camera frames gave a pose;
++                // gaps p90 0.16 s, p99 0.55 s, 40% of the time in gaps > 0.2 s; single bad fixes up to 15 cm get past
++                // room_pose.py's jump filter. Per episode: a frame is lost with probability U(0, DROP_MAX); a burst of
++                // lost frames starts with probability U(0, BURST_START_MAX) per frame and lasts U(BURST_MIN, BURST_MAX) s
++                // on average; an accepted frame is off by U(BAD_FIX_MIN, BAD_FIX_MAX) m with probability U(0, BAD_FIX_PROB_MAX).
++                static constexpr bool DROPOUTS = OPTIONS::EXTERNAL_POSE_DROPOUTS;
++                // policy.cpp POSITION_OBSERVATION_GAIN: the position estimate is scaled by this before the clip
++                static constexpr double POSITION_GAIN = OPTIONS::EXTERNAL_POSE_POSITION_GAIN_PCT / 100.0;
++                static constexpr double DROP_MAX = 0.4;
++                static constexpr double BURST_START_MAX = 0.08;
++                static constexpr double BURST_MIN = 0.1;
++                static constexpr double BURST_MAX = 0.6;
++                static constexpr double BAD_FIX_PROB_MAX = 0.04;
++                static constexpr double BAD_FIX_MIN = 0.05;
++                static constexpr double BAD_FIX_MAX = 0.15;
++                // room_pose.py: no frame for --hold-time (0.2 s) -> sends "no fix"; Velocity restarts after a 0.3 s gap.
++                // policy.cpp: no heartbeat change for EXTERNAL_TIMEOUT_US (0.25 s) -> not valid; dead-reckons
++                // PREDICTOR_DEAD_RECKON_US (0.5 s) after the last valid value, then observes position = velocity = 0;
++                // clips the observation to MAX_POSITION_ERROR / MAX_LINEAR_VELOCITY_ERROR.
++                static constexpr TI SENDER_HOLD = 20;
++                static constexpr TI VELOCITY_RESTART_GAP = 30;
++                static constexpr TI FIRMWARE_TIMEOUT = 25;
++                static constexpr TI DEAD_RECKON = 50;
++                static constexpr double MAX_POSITION_ERROR = 0.5;
++                static constexpr double MAX_LINEAR_VELOCITY_ERROR = 1.5;
++                static_assert(!DROPOUTS || PREDICT, "dropouts are modelled through the on-board predictor");
++            };
++            using STATE_BASE = rl_tools::utils::typing::conditional_t<OPTIONS::EXTERNAL_POSE, StateExternalPose<StateExternalPoseSpecification<T, TI, EXTERNAL_POSE_CONFIG, STATE_BASE_GYRO>>, STATE_BASE_GYRO>;
+             using STATE_TYPE_MOTOR_DELAY = StateTrajectory<StateSpecification<T, TI, StateRotorsHistory<StateRotorsHistorySpecification<T, TI, OPTIONS::ACTION_HISTORY_LENGTH, CLOSED_FORM, StateRandomForce<StateSpecification<T, TI, STATE_BASE>>>>>>;
+             using STATE_TYPE_NO_MOTOR_DELAY = StateRandomForce<StateSpecification<T, TI, STATE_BASE>>;
+             using STATE_TYPE = rl_tools::utils::typing::conditional_t<OPTIONS::MOTOR_DELAY, STATE_TYPE_MOTOR_DELAY, STATE_TYPE_NO_MOTOR_DELAY>;
+             static_assert(!OPTIONS::ACTION_HISTORY || OPTIONS::MOTOR_DELAY, "Action history implies motor delay");
+-            using OBSERVATION_TYPE = observation::Position<observation::PositionSpecification<T, TI,
+-                    observation::OrientationRotationMatrix<observation::OrientationRotationMatrixSpecification<T, TI,
+-                    observation::LinearVelocity<observation::LinearVelocitySpecification<T, TI,
+-                    observation::AngularVelocityDelayed<observation::AngularVelocityDelayedSpecification<T, TI, ANGULAR_VELOCITY_DELAY,
++            using OBSERVATION_TAIL = observation::AngularVelocityDelayed<observation::AngularVelocityDelayedSpecification<T, TI, ANGULAR_VELOCITY_DELAY,
+                     observation::ActionHistory<observation::ActionHistorySpecification<T, TI, OPTIONS::ACTION_HISTORY ? OPTIONS::ACTION_HISTORY_LENGTH : 1 // one-step action history to Markovify the d_action regularization
+-            >>>>>>>>>>;
++            >>>>;
++            using OBSERVATION_TYPE_STATE = observation::Position<observation::PositionSpecification<T, TI,
++                    observation::OrientationRotationMatrix<observation::OrientationRotationMatrixSpecification<T, TI,
++                    observation::LinearVelocity<observation::LinearVelocitySpecification<T, TI, OBSERVATION_TAIL>>>>>>;
++            using OBSERVATION_TYPE_EXTERNAL = observation::PositionExternal<observation::PositionExternalSpecification<T, TI,
++                    observation::OrientationRotationMatrix<observation::OrientationRotationMatrixSpecification<T, TI,
++                    observation::LinearVelocityExternal<observation::LinearVelocityExternalSpecification<T, TI, OBSERVATION_TAIL>>>>>>;
++            using OBSERVATION_TYPE = rl_tools::utils::typing::conditional_t<OPTIONS::EXTERNAL_POSE, OBSERVATION_TYPE_EXTERNAL, OBSERVATION_TYPE_STATE>;
++            static_assert(OBSERVATION_TYPE_EXTERNAL::DIM == OBSERVATION_TYPE_STATE::DIM, "same layout as on the drone");
+             using OBSERVATION_TYPE_PRIVILEGED = OBSERVATION_TYPE;
+             static constexpr bool PRIVILEGED_OBSERVATION_NOISE = false;
+             using PARAMETERS = typename BASE_ENV::PARAMETERS_TYPE;
+diff --git a/src/foundation_policy/post_training/eval_external_pose.cpp b/src/foundation_policy/post_training/eval_external_pose.cpp
+new file mode 100644
+index 00000000..5dab80a4
+--- /dev/null
++++ b/src/foundation_policy/post_training/eval_external_pose.cpp
+@@ -0,0 +1,231 @@
++#ifndef RL_TOOLS_DEBUG_CONTAINER_CHECK_BOUNDS
++// #define RL_TOOLS_DEBUG_CONTAINER_CHECK_BOUNDS
++#endif
++#include <cstdlib>
++#include <rl_tools/operations/cpu_mux.h>
++#include <rl_tools/nn/optimizers/adam/instance/operations_generic.h>
++#include <rl_tools/nn/operations_cpu_mux.h>
++#include <rl_tools/nn/layers/sample_and_squash/operations_generic.h>
++#include <rl_tools/nn/layers/td3_sampling/operations_generic.h>
++#include <rl_tools/nn/layers/standardize/operations_generic.h>
++#include <rl_tools/nn/operations_cpu_mux.h>
++#include <rl_tools/nn_models/mlp/operations_generic.h>
++#include <rl_tools/nn_models/mlp_unconditional_stddev/operations_generic.h>
++#include <rl_tools/nn_models/random_uniform/operations_generic.h>
++#include <rl_tools/nn_models/sequential/operations_generic.h>
++#include <rl_tools/nn_models/multi_agent_wrapper/operations_generic.h>
++#include <rl_tools/nn/optimizers/adam/operations_generic.h>
++
++#include <rl_tools/containers/tensor/persist.h>
++#include <rl_tools/nn/layers/sample_and_squash/persist.h>
++#include <rl_tools/nn/layers/dense/persist.h>
++#include <rl_tools/nn/layers/standardize/persist.h>
++#include <rl_tools/nn/layers/gru/persist.h>
++#include <rl_tools/nn/layers/td3_sampling/persist.h>
++#include <rl_tools/nn_models/mlp/persist.h>
++#include <rl_tools/nn_models/sequential/persist.h>
++#include <rl_tools/nn_models/multi_agent_wrapper/persist.h>
++#include <rl_tools/rl/components/replay_buffer/persist.h>
++
++#include <rl_tools/containers/tensor/persist_code.h>
++#include <rl_tools/nn/optimizers/adam/instance/persist_code.h>
++#include <rl_tools/nn/layers/dense/persist_code.h>
++#include <rl_tools/nn/layers/standardize/persist_code.h>
++#include <rl_tools/nn/layers/gru/persist_code.h>
++#include <rl_tools/nn/layers/sample_and_squash/persist_code.h>
++#include <rl_tools/nn/layers/td3_sampling/persist_code.h>
++#include <rl_tools/nn_models/mlp/persist_code.h>
++#include <rl_tools/nn_models/sequential/persist_code.h>
++#include <rl_tools/nn_models/multi_agent_wrapper/persist_code.h>
++
++#include "environment.h"
++
++#include <rl_tools/rl/algorithms/sac/loop/core/operations_generic.h>
++
++#include <rl_tools/rl/loop/steps/timing/operations_cpu.h>
++#include <rl_tools/rl/loop/steps/extrack/operations_cpu.h>
++#include <rl_tools/rl/loop/steps/checkpoint/operations_cpu.h>
++#include <rl_tools/rl/loop/steps/evaluation/operations_generic.h>
++#include <rl_tools/rl/loop/steps/save_trajectories/operations_cpu.h>
++#include <rl_tools/rl/loop/steps/nn_analytics/operations_cpu.h>
++
++#include <rl_tools/rl/utils/evaluation/operations_cpu.h>
++
++#include "../pre_training/config.h"
++#include "../pre_training/options.h"
++namespace rlt = rl_tools;
++
++#include "helper.h"
++
++
++using DEVICE = rlt::devices::DEVICE_FACTORY<>;
++using RNG = DEVICE::SPEC::RANDOM::ENGINE<>;
++using RNG_PARAMS_DEVICE = rlt::devices::random::Generic<DEVICE::SPEC::MATH>;
++using RNG_PARAMS = RNG_PARAMS_DEVICE::ENGINE<>;
++using TI = DEVICE::index_t;
++using T = float;
++
++#define RL_TOOLS_POST_TRAINING
++#include "config.h"
++
++// Compares policies in the simulator with perfect position/velocity and with the wall-ArUco tracker model
++// (StateExternalPose: delayed, 20 Hz, noisy, low-passed velocity), on the teachers' dynamics.
++// usage: eval_external_pose <checkpoint.h5> [<checkpoint.h5> ...]   (run in the post-training run folder)
++struct OPTIONS_PERFECT: OPTIONS_POST_TRAINING{
++    static constexpr bool EXTERNAL_POSE_PREDICT = false;
++    static constexpr bool EXTERNAL_POSE = false;
++    static constexpr bool EXTERNAL_POSE_DROPOUTS = false;
++};
++using ENV_PERFECT = typename builder::ENVIRONMENT_FACTORY_POST_TRAINING<DEVICE, T, TI, OPTIONS_PERFECT>::ENVIRONMENT;
++struct OPTIONS_TRACKER: OPTIONS_POST_TRAINING{
++    static constexpr bool EXTERNAL_POSE = true;
++    static constexpr bool EXTERNAL_POSE_PREDICT = false;
++    static constexpr bool EXTERNAL_POSE_DROPOUTS = false;
++};
++struct OPTIONS_PREDICT: OPTIONS_POST_TRAINING{
++    static constexpr bool EXTERNAL_POSE = true;
++    static constexpr bool EXTERNAL_POSE_PREDICT = true;
++    static constexpr bool EXTERNAL_POSE_PREDICT_ACCEL = true;
++    static constexpr bool EXTERNAL_POSE_ACCEL_REAL = false;
++    static constexpr int EXTERNAL_POSE_ACCEL_BIAS_TAU_MS = 0;
++    static constexpr bool EXTERNAL_POSE_DROPOUTS = false;
++};
++using ENV_TRACKER = typename builder::ENVIRONMENT_FACTORY_POST_TRAINING<DEVICE, T, TI, OPTIONS_TRACKER>::ENVIRONMENT;
++using ENV_PREDICT = typename builder::ENVIRONMENT_FACTORY_POST_TRAINING<DEVICE, T, TI, OPTIONS_PREDICT>::ENVIRONMENT;
++// accelerometer as measured in log31 (offset 0.5-2 m/s^2 drifting, noise 2.5 m/s^2), with the firmware's offset removal
++template <int TAU_MS, bool ACCEL = true, bool DROPOUTS = false, int GAIN_PCT = 100>
++struct OPTIONS_PREDICT_REAL: OPTIONS_PREDICT{
++    static constexpr int EXTERNAL_POSE_POSITION_GAIN_PCT = GAIN_PCT;
++    static constexpr bool EXTERNAL_POSE_DROPOUTS = DROPOUTS; // camera frames lost in bursts + bad fixes (flights 2026-10-21/22)
++    static constexpr bool EXTERNAL_POSE_PREDICT_ACCEL = ACCEL;
++    static constexpr bool EXTERNAL_POSE_ACCEL_REAL = true;
++    static constexpr int EXTERNAL_POSE_ACCEL_BIAS_TAU_MS = TAU_MS;
++};
++template <int TAU_MS, bool ACCEL = true, bool DROPOUTS = false, int GAIN_PCT = 100>
++using ENV_PREDICT_REAL = typename builder::ENVIRONMENT_FACTORY_POST_TRAINING<DEVICE, T, TI, OPTIONS_PREDICT_REAL<TAU_MS, ACCEL, DROPOUTS, GAIN_PCT>>::ENVIRONMENT;
++constexpr TI N_EP = 50;
++constexpr TI N_DYNAMICS = 40;
++
++template <typename ENV>
++void run(DEVICE& device, const std::string& name, const std::string& actor_path, const std::vector<std::string>& dynamics_json, RNG& rng){
++    using EVAL_ACTOR = typename ACTOR::template CHANGE_BATCH_SIZE<TI, N_EP>::template CHANGE_CAPABILITY<rlt::nn::capability::Forward<DYNAMIC_ALLOCATION>>;
++    EVAL_ACTOR actor;
++    rlt::malloc(device, actor);
++    auto file = HighFive::File(actor_path, HighFive::File::ReadOnly);
++    rlt::load(device, actor, file.getGroup("actor"));
++    using RESULT = rlt::rl::utils::evaluation::Result<rlt::rl::utils::evaluation::Specification<T, TI, ENV, N_EP, ENV::EPISODE_STEP_LIMIT>>;
++    double crashed = 0, episodes = 0, pos_err = 0, speed = 0, n_steady = 0, ret = 0;
++    double sway2[3] = {0, 0, 0}, n_sway = 0; // spread around each episode's own mean position (what the trim cannot remove)
++    for(const auto& js: dynamics_json){
++        ENV env;
++        rlt::init(device, env);
++        typename ENV::Parameters params;
++        rlt::from_json(device, env, js, params);
++        if(std::getenv("EVAL_IMBALANCE")){
++            // the real Air75 (2026-10-23, d4-d6): front-right rotor (0) weak, battery sagging
++            for(TI r = 0; r < 4; r++){
++                for(TI j = 0; j < 3; j++){
++                    params.dynamics.rotor_thrust_coefficients[r][j] *= (r == 0 ? 0.8 : 1.0) * 0.93;
++                }
++            }
++        }
++        auto init_old = env.parameters.mdp.init; // as in helper.h sample_trajectories
++        env.parameters = params;
++        env.parameters.mdp.init = init_old;
++        rlt::sample_initial_parameters(device, env, env.parameters, rng);
++        RESULT result;
++        rlt::rl::utils::evaluation::Data<rlt::rl::utils::evaluation::DataSpecification<typename RESULT::SPEC>> data;
++        rlt::malloc(device, data);
++        rlt::rl::environments::DummyUI ui;
++        rlt::Mode<rlt::mode::Evaluation<>> mode;
++        rlt::evaluate(device, env, ui, actor, result, data, rng, mode);
++        ret += result.returns_mean;
++        for(TI ep = 0; ep < N_EP; ep++){
++            bool crash = false;
++            for(TI s = 0; s < ENV::EPISODE_STEP_LIMIT; s++){
++                if(rlt::get(device, data.terminated, ep, s)){ crash = true; break; }
++            }
++            episodes++;
++            if(crash){ crashed++; continue; }
++            // EVAL_WINDOW_START (steps, default half the episode): start of the hover window
++            const TI window_start = std::getenv("EVAL_WINDOW_START") ? std::atoi(std::getenv("EVAL_WINDOW_START")) : ENV::EPISODE_STEP_LIMIT / 2;
++            double sum[3] = {0, 0, 0}, sum2[3] = {0, 0, 0}, n_ep = 0;
++            for(TI s = window_start; s < ENV::EPISODE_STEP_LIMIT; s++){
++                const auto& st = rlt::get(device, data.states, ep, s);
++                if(st.trajectory.type != rlt::rl::environments::l2f::POSITION) break;
++                for(TI i = 0; i < 3; i++){ sum[i] += st.position[i]; sum2[i] += st.position[i] * st.position[i]; }
++                n_ep++;
++                pos_err += std::sqrt(st.position[0]*st.position[0] + st.position[1]*st.position[1] + st.position[2]*st.position[2]);
++                speed += std::sqrt(st.linear_velocity[0]*st.linear_velocity[0] + st.linear_velocity[1]*st.linear_velocity[1] + st.linear_velocity[2]*st.linear_velocity[2]);
++                n_steady++;
++            }
++            if(n_ep > 1){
++                for(TI i = 0; i < 3; i++) sway2[i] += sum2[i] / n_ep - (sum[i] / n_ep) * (sum[i] / n_ep);
++                n_sway++;
++            }
++        }
++        rlt::free(device, data);
++    }
++    std::printf("%-8s %-60s crashes %5.1f%%  return %6.1f  hover window: mean distance to target %5.1f cm, mean speed %5.1f cm/s, sway x/y/z %4.1f %4.1f %4.1f cm\n",
++        name.c_str(), actor_path.c_str(), 100 * crashed / episodes, ret / dynamics_json.size(), 100 * pos_err / n_steady, 100 * speed / n_steady,
++        100 * std::sqrt(sway2[0] / n_sway), 100 * std::sqrt(sway2[1] / n_sway), 100 * std::sqrt(sway2[2] / n_sway));
++    std::fflush(stdout);
++    rlt::free(device, actor);
++}
++
++int main(int argc, char** argv){
++    DEVICE device;
++    rlt::init(device);
++    std::string experiment = "2026-09-28_17-48-14";
++    if (const char* e = std::getenv("RAPTOR_TEACHER_EXPERIMENT")) experiment = e;
++    std::ifstream index("./src/foundation_policy/checkpoints_" + experiment + ".txt");
++    std::vector<std::string> lines; std::string line;
++    while(std::getline(index, line)) if(!line.empty()) lines.push_back(line);
++    std::vector<std::string> dynamics_json;
++    for(TI i = 0; i < N_DYNAMICS && i < lines.size(); i++){
++        auto id = split_by_comma(lines[(i * lines.size()) / N_DYNAMICS])[0]; // spread over the whole range
++        std::ifstream f("./src/foundation_policy/dynamics_parameters_" + experiment + "/" + id + ".json");
++        dynamics_json.emplace_back((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++    }
++    std::cout << "dynamics sets: " << dynamics_json.size() << " x " << N_EP << " episodes" << std::endl;
++    for(int a = 1; a < argc; a++){
++        if(std::getenv("EVAL_SKIP_BASIC") == nullptr){
++        RNG rng; rlt::malloc(device, rng); rlt::init(device, rng, 1);
++        run<ENV_PERFECT>(device, "perfect", argv[a], dynamics_json, rng);
++        RNG rng2; rlt::malloc(device, rng2); rlt::init(device, rng2, 1);
++        run<ENV_TRACKER>(device, "tracker", argv[a], dynamics_json, rng2);
++        }
++        RNG rng3; rlt::malloc(device, rng3); rlt::init(device, rng3, 1);
++        run<ENV_PREDICT>(device, "predict", argv[a], dynamics_json, rng3);
++        if(std::getenv("EVAL_DROPOUTS")){
++            RNG r10; rlt::malloc(device, r10); rlt::init(device, r10, 1);
++            run<ENV_PREDICT_REAL<2000>>(device, "real_t2", argv[a], dynamics_json, r10);
++            RNG r11; rlt::malloc(device, r11); rlt::init(device, r11, 1);
++            run<ENV_PREDICT_REAL<2000, true, true>>(device, "dropout", argv[a], dynamics_json, r11);
++        }
++        if(std::getenv("EVAL_GAINS")){
++            RNG g1; rlt::malloc(device, g1); rlt::init(device, g1, 1);
++            run<ENV_PREDICT_REAL<2000, true, true, 100>>(device, "gain100", argv[a], dynamics_json, g1);
++            RNG g2; rlt::malloc(device, g2); rlt::init(device, g2, 1);
++            run<ENV_PREDICT_REAL<2000, true, true, 80>>(device, "gain80", argv[a], dynamics_json, g2);
++            RNG g3; rlt::malloc(device, g3); rlt::init(device, g3, 1);
++            run<ENV_PREDICT_REAL<2000, true, true, 60>>(device, "gain60", argv[a], dynamics_json, g3);
++            RNG g4; rlt::malloc(device, g4); rlt::init(device, g4, 1);
++            run<ENV_PREDICT_REAL<2000, true, true, 40>>(device, "gain40", argv[a], dynamics_json, g4);
++        }
++        if(std::getenv("EVAL_REAL_ACCEL")){
++            RNG r4; rlt::malloc(device, r4); rlt::init(device, r4, 1);
++            run<ENV_PREDICT_REAL<0>>(device, "real", argv[a], dynamics_json, r4);
++            RNG r5; rlt::malloc(device, r5); rlt::init(device, r5, 1);
++            run<ENV_PREDICT_REAL<1000>>(device, "real_t1", argv[a], dynamics_json, r5);
++            RNG r6; rlt::malloc(device, r6); rlt::init(device, r6, 1);
++            run<ENV_PREDICT_REAL<2000>>(device, "real_t2", argv[a], dynamics_json, r6);
++            RNG r8; rlt::malloc(device, r8); rlt::init(device, r8, 1);
++            run<ENV_PREDICT_REAL<4000>>(device, "real_t4", argv[a], dynamics_json, r8);
++            RNG r9; rlt::malloc(device, r9); rlt::init(device, r9, 1);
++            run<ENV_PREDICT_REAL<8000>>(device, "real_t8", argv[a], dynamics_json, r9);
++            RNG r7; rlt::malloc(device, r7); rlt::init(device, r7, 1);
++            run<ENV_PREDICT_REAL<0, false>>(device, "vel_only", argv[a], dynamics_json, r7);
++        }
++    }
++}
+diff --git a/src/foundation_policy/post_training/main.cpp b/src/foundation_policy/post_training/main.cpp
+index 10d8b73b..33d37d47 100644
+--- a/src/foundation_policy/post_training/main.cpp
++++ b/src/foundation_policy/post_training/main.cpp
+@@ -1,6 +1,7 @@
+ #ifndef RL_TOOLS_DEBUG_CONTAINER_CHECK_BOUNDS
+ // #define RL_TOOLS_DEBUG_CONTAINER_CHECK_BOUNDS
+ #endif
++#include <cstdlib>
+ #include <rl_tools/operations/cpu_mux.h>
+ #include <rl_tools/nn/optimizers/adam/instance/operations_generic.h>
+ #include <rl_tools/nn/operations_cpu_mux.h>
+@@ -81,6 +82,36 @@ using CRITIC_TEMP = CRITIC::CHANGE_CAPABILITY<rlt::nn::capability::Forward<DYNAM
+ using ACTOR_ORIG = LOOP_CONFIG::ACTOR_CRITIC_TYPE::SPEC::ACTOR_NETWORK_TYPE;
+ using ACTOR_TEACHER = ACTOR_ORIG::CHANGE_BATCH_SIZE<TI, 32>::CHANGE_CAPABILITY<rlt::nn::capability::Forward<>>;
+ 
++// 2026-10-23: the real Air75 flies with one motor commanded ~30% above the others for the whole flight (front right,
++// d4-d6) and a battery sagging to 2.6-3.5 V. Each gathered epoch, a copy of the teacher's dynamics gets with
++// probability MOTOR_IMBALANCE_PROB one random rotor weakened to U(MOTOR_WEAK_MIN, 1) of its thrust, and all rotors
++// scaled by U(BATTERY_SAG_MIN, 1).
++constexpr bool MOTOR_IMBALANCE = true;
++constexpr T MOTOR_IMBALANCE_PROB = 0.75;
++constexpr T MOTOR_WEAK_MIN = 0.75;
++constexpr T BATTERY_SAG_MIN = 0.9;
++
++template <typename PARAMETERS>
++PARAMETERS perturb_motors(DEVICE& device, const PARAMETERS& parameters, RNG& rng){
++    PARAMETERS p = parameters;
++    if constexpr(MOTOR_IMBALANCE){
++        T sag = rlt::random::uniform_real_distribution(device.random, BATTERY_SAG_MIN, (T)1, rng);
++        TI weak = 4;
++        T weak_scale = 1;
++        if(rlt::random::uniform_real_distribution(device.random, (T)0, (T)1, rng) < MOTOR_IMBALANCE_PROB){
++            weak = rlt::random::uniform_int_distribution(device.random, (TI)0, (TI)3, rng);
++            weak_scale = rlt::random::uniform_real_distribution(device.random, MOTOR_WEAK_MIN, (T)1, rng);
++        }
++        for(TI rotor_i = 0; rotor_i < 4; rotor_i++){
++            T scale = sag * (rotor_i == weak ? weak_scale : 1);
++            for(TI j = 0; j < 3; j++){
++                p.dynamics.rotor_thrust_coefficients[rotor_i][j] *= scale;
++            }
++        }
++    }
++    return p;
++}
++
+ struct CHECKPOINT_PARAMETERS{
+     static constexpr TI TEST_INPUT_BATCH_SIZE = 2;
+ };
+@@ -147,9 +178,9 @@ int main(int argc, char** argv){
+     T best_return = 0;
+     bool best_return_set = false;
+ 
+-#ifdef RL_TOOLS_ENABLE_TENSORBOARD
+     auto timestamp_string = rlt::utils::extrack::get_timestamp_string();
+     std::filesystem::path run_path = "logs/" + timestamp_string;
++#ifdef RL_TOOLS_ENABLE_TENSORBOARD
+     rlt::init(device, device.logger, run_path.string());
+ #endif
+     rlt::init(device, rng, seed);
+@@ -165,6 +196,13 @@ int main(int argc, char** argv){
+     // checkpoint_path.experiment = "2025-04-07_23-12-07";
+     // checkpoint_path.experiment = "2025-04-08_23-23-52";
+     checkpoint_path.experiment = "2025-04-16_20-10-58";
++    // Set RAPTOR_TEACHER_EXPERIMENT to the pre-training $RL_TOOLS_EXTRACK_EXPERIMENT to use self-trained teachers from ./experiments
++    std::string teacher_experiments_dir = "1k-experiments";
++    if (const char* teacher_experiment = std::getenv("RAPTOR_TEACHER_EXPERIMENT")){
++        checkpoint_path.experiment = teacher_experiment;
++        teacher_experiments_dir = "experiments";
++    }
++    std::cout << "Loading teachers from: " << teacher_experiments_dir << "/" << checkpoint_path.experiment << std::endl;
+     checkpoint_path.name = "foundation-policy-pre-training";
+ 
+     std::filesystem::path dynamics_parameters_path = "./src/foundation_policy/dynamics_parameters_" + checkpoint_path.experiment + "/";
+@@ -197,7 +235,7 @@ int main(int argc, char** argv){
+         auto cpp_copy = checkpoint_path;
+         cpp_copy.attributes["dynamics-id"] = checkpoint_info_split[0]; // take from the end because we order by performance and the best are at the end
+         cpp_copy.step = checkpoint_info_split[1];
+-        rlt::find_latest_run(device, "1k-experiments", cpp_copy);
++        rlt::find_latest_run(device, teacher_experiments_dir, cpp_copy);
+         auto actor_file = HighFive::File(cpp_copy.checkpoint_path.string(), HighFive::File::ReadOnly);
+         rlt::load(device, actor_teacher[teacher_i], actor_file.getGroup("actor"));
+ 
+@@ -264,7 +302,8 @@ int main(int argc, char** argv){
+                 constexpr TI TEACHER_EPOCHS = (TEACHER_STUDENT_MIX > 0 ? TEACHER_STUDENT_MIX : 1);
+                 for (TI teacher_epoch_i = 0; teacher_epoch_i < TEACHER_EPOCHS; teacher_epoch_i++){
+                     static_assert(DATASET_SIZE >= NUM_TEACHERS * TEACHER_EPOCHS * NUM_EPISODES * ENVIRONMENT::EPISODE_STEP_LIMIT);
+-                    auto result = gather_epoch<ENVIRONMENT_TEACHER, ENVIRONMENT_TEACHER::Observation, ENVIRONMENT::Observation, NUM_EPISODES, TEACHER_DETERMINISTIC>(device, actor_teacher[teacher_i], teacher_meta, teacher_parameters[teacher_i], actor_teacher[teacher_i], dataset_episode_start_indices, dataset_input, dataset_output_target, dataset_truncated, dataset_reset, current_episode, current_index, rng);
++                    auto perturbed_parameters = perturb_motors(device, teacher_parameters[teacher_i], rng);
++                    auto result = gather_epoch<ENVIRONMENT_TEACHER, ENVIRONMENT_TEACHER::Observation, ENVIRONMENT::Observation, NUM_EPISODES, TEACHER_DETERMINISTIC>(device, actor_teacher[teacher_i], teacher_meta, perturbed_parameters, actor_teacher[teacher_i], dataset_episode_start_indices, dataset_input, dataset_output_target, dataset_truncated, dataset_reset, current_episode, current_index, rng);
+                     if (epoch_i < EPOCH_TEACHER_FORCING){
+                         NUM_AVG++;
+                         average_result.returns_mean += result.returns_mean;
+@@ -286,7 +325,8 @@ int main(int argc, char** argv){
+                 auto& result = results[teacher_i];
+                 auto& data = datas[teacher_i];
+                 // auto result = gather_epoch<ENVIRONMENT, ENVIRONMENT_TEACHER::Observation, ENVIRONMENT::Observation, NUM_EPISODES, TEACHER_DETERMINISTIC>(device, actor_teacher[teacher_i], teacher_parameters[teacher_i], actor, dataset_episode_start_indices, dataset_input, dataset_output_target, dataset_truncated, dataset_reset, current_episode, current_index, rng);
+-                sample_trajectories<ENVIRONMENT>(device, actor, teacher_parameters[teacher_i], result, data, rng);
++                auto perturbed_parameters = perturb_motors(device, teacher_parameters[teacher_i], rng);
++                sample_trajectories<ENVIRONMENT>(device, actor, perturbed_parameters, result, data, rng);
+                 NUM_AVG++;
+                 average_result.returns_mean += result.returns_mean;
+                 average_result.returns_std += result.returns_mean * result.returns_mean;
+diff --git a/src/foundation_policy/post_training/main_sequential.cpp b/src/foundation_policy/post_training/main_sequential.cpp
+index b17143a4..bd74be47 100644
+--- a/src/foundation_policy/post_training/main_sequential.cpp
++++ b/src/foundation_policy/post_training/main_sequential.cpp
+@@ -63,6 +63,8 @@ using T = float;
+ constexpr bool DYNAMIC_ALLOCATION = true;
+ 
+ struct OPTIONS_POST_TRAINING: OPTIONS_PRE_TRAINING{
++    static constexpr bool EXTERNAL_POSE = false;
++    static constexpr bool EXTERNAL_POSE_PREDICT = false;
+     static constexpr bool OBSERVE_THRASH_MARKOV = false;
+     static constexpr bool MOTOR_DELAY = true;
+     static constexpr bool ACTION_HISTORY = true;
+diff --git a/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp b/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp
+index 4716b69b..919a0e54 100644
+--- a/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp
++++ b/src/foundation_policy/pre_training/sample_dynamics_parameters.cpp
+@@ -21,7 +21,7 @@ int main(int argc, char** argv){
+     RNG rng;
+     rlt::malloc(device, rng);
+     TI seed = 0;
+-    TI N = 1000;
++    TI N = 300; // narrower (whoop-class) range than the original 1000 teachers
+     rlt::init(device, rng, seed);
+     ENVIRONMENT env;
+     ENVIRONMENT::Parameters params;
+@@ -45,22 +45,24 @@ int main(int argc, char** argv){
+         };
+         // parameters.mdp.init.max_position = 0.5;
+ 
++        // Narrowed to 75mm 1S whoops (e.g. BetaFPV Air75 II, ~30-45 g flying weight).
++        // Original RAPTOR ranges in trailing comments.
+         parameters.domain_randomization = {
+-            1.5, // thrust_to_weight_min;
+-            5.0, // thrust_to_weight_max;
+-            40, // torque_to_inertia_min;
+-            1200, // torque_to_inertia_max;
+-            0.02, // mass_min;
+-            5.00, // mass_max;
++            3.0, // thrust_to_weight_min; (1.5)
++            8.0, // thrust_to_weight_max; (5.0)
++            300, // torque_to_inertia_min; (40)
++            2000, // torque_to_inertia_max; (1200)
++            0.020, // mass_min; (0.02) sampled uniformly in cbrt(mass) -> midpoint ~40 g
++            0.070, // mass_max; (5.00)
+             0.1, // mass_size_deviation;
+-            0.03, // motor_time_constant_rising_min;
+-            0.10, // motor_time_constant_rising_max;
+-            0.03, // motor_time_constant_falling_min;
+-            0.30, // motor_time_constant_falling_max;
+-            0.005, // rotor_torque_constant_min;
+-            0.05, // rotor_torque_constant_max;
++            0.02, // motor_time_constant_rising_min; (0.03)
++            0.06, // motor_time_constant_rising_max; (0.10)
++            0.02, // motor_time_constant_falling_min; (0.03)
++            0.12, // motor_time_constant_falling_max; (0.30)
++            0.004, // rotor_torque_constant_min; (0.005)
++            0.012, // rotor_torque_constant_max; (0.05)
+             0.0, // orientation_offset_angle_max;
+-            0.3  // disturbance_force_max;
++            0.15  // disturbance_force_max; (0.3) scales with surplus thrust, halved to keep magnitude similar at higher T/W
+         };
+     };
+     overwrite(env.parameters);
+@@ -73,6 +75,31 @@ int main(int argc, char** argv){
+         overwrite(params);
+         rlt::sample_initial_parameters(device, env, params, rng);
+         overwrite(params);
++        {
++            // Pin arm length (center to rotor) to ARM_LENGTH_MIN..MAX instead of scaling it with mass.
++            // Inertia is scaled by the same factor so the sampled torque_to_inertia is preserved.
++            constexpr T ARM_LENGTH_MIN = 0.036;
++            constexpr T ARM_LENGTH_MAX = 0.044;
++            T arm_length_target = rlt::random::uniform_real_distribution(device.random, ARM_LENGTH_MIN, ARM_LENGTH_MAX, rng);
++            auto& p = params.dynamics.rotor_positions;
++            T arm_length = rlt::math::sqrt(device.math, p[0][0] * p[0][0] + p[0][1] * p[0][1] + p[0][2] * p[0][2]);
++            T factor = arm_length_target / arm_length;
++            T max_rotor_distance = 0;
++            for (TI rotor_i=0; rotor_i < 4; rotor_i++){
++                for (TI axis_i=0; axis_i < 3; axis_i++){
++                    p[rotor_i][axis_i] *= factor;
++                }
++                T rotor_distance = rlt::math::sqrt(device.math, p[rotor_i][0] * p[rotor_i][0] + p[rotor_i][1] * p[rotor_i][1] + p[rotor_i][2] * p[rotor_i][2]);
++                max_rotor_distance = rotor_distance > max_rotor_distance ? rotor_distance : max_rotor_distance;
++            }
++            for (TI axis_i=0; axis_i < 3; axis_i++){
++                params.dynamics.J[axis_i][axis_i] *= factor;
++                params.dynamics.J_inv[axis_i][axis_i] /= factor;
++            }
++            // same scaling as in l2f sample_initial_parameters
++            params.mdp.termination.position_threshold = max_rotor_distance * 20;
++            params.mdp.init.max_position = max_rotor_distance * 10;
++        }
+         std::ofstream output(output_path / (std::to_string(set_i) + ".json"));
+         auto params_copy = params;
+         // disable domain randomization for pre_training and post_training;

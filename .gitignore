@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+# written while flying / testing
+position/last_trim.json
+position/fpv_calib_views.npz
+room_pose_*.csv
+room_pose_*.avi
+!examples/room_pose_*.csv
+!examples/room_pose_*.avi
+video_delay_*.csv
+check.jpg
+snap_*.jpg
+# blackbox exports and their caches
+*.bbl
+*.BFL
+*.npy
+*_h.txt

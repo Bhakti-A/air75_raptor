@@ -1,0 +1,5 @@
+# laptop side (position/, analysis/)
+numpy
+opencv-python>=4.8   # cv2.aruco.ArucoDetector; developed with OpenCV 5.0
+pyserial             # zorro_link.py, firmware/restore_air75_settings.py
+pillow               # position/markers/make_room_markers.py only

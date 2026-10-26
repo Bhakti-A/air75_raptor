@@ -1,0 +1,55 @@
+
+# version
+# Betaflight / STM32G47X (SG47) 4.6.0 Aug 23 2026 / 15:08:11 (norevision) MSP API: 1.47
+# config rev: ec42951
+
+# start the command batch
+batch start
+
+# reset configuration to default settings
+defaults nosave
+
+board_name BETAFPVG473_V2_BMI270
+manufacturer_id BEFH
+mcu_id 002c00273335510136383532
+signature 
+
+# feature
+feature LED_STRIP
+feature OSD
+
+# aux
+aux 0 0 0 1800 2100 0 0
+aux 1 1 2 1300 1700 0 0
+
+# master
+set acc_calibration = 83,2,-28,1
+set min_check = 1080
+set align_board_yaw = 225
+set yaw_motors_reversed = ON
+set small_angle = 180
+
+profile 0
+
+profile 1
+
+profile 2
+
+profile 3
+
+# restore original profile selection
+profile 0
+
+rateprofile 0
+
+rateprofile 1
+
+rateprofile 2
+
+rateprofile 3
+
+# restore original rateprofile selection
+rateprofile 0
+
+# save configuration
+save

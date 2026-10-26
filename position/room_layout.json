@@ -1,0 +1,14 @@
+{
+  "_frame": "origin on the floor under the middle marker column; x into the wall, y left (facing the wall), z up; metres",
+  "_measured": "side 15.95 cm, floor to lower black edge 31.5 cm, floor to upper row top edge 115 cm, 37.7 cm between neighbours' black edges (53.65 cm centre to centre)",
+  "dict": "DICT_4X4_50",
+  "marker_size": 0.1595,
+  "markers": {
+    "10": [0.0,  0.5365, 0.395],
+    "12": [0.0,  0.0,    0.395],
+    "14": [0.0, -0.5365, 0.395],
+    "11": [0.0,  0.5365, 1.070],
+    "13": [0.0,  0.0,    1.070],
+    "15": [0.0, -0.5365, 1.070]
+  }
+}

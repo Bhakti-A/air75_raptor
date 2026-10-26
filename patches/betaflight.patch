@@ -1,0 +1,46 @@
+diff --git a/Makefile b/Makefile
+index c97d7438a..6cf81b442 100644
+--- a/Makefile
++++ b/Makefile
+@@ -391,6 +391,11 @@ TARGET_EXST_ELF := $(OBJECT_DIR)/$(FORKNAME)_$(TARGET_NAME)_EXST.elf
+ TARGET_UNPATCHED_BIN := $(OBJECT_DIR)/$(FORKNAME)_$(TARGET_NAME)_UNPATCHED.bin
+ TARGET_LST      := $(OBJECT_DIR)/$(FORKNAME)_$(TARGET_NAME).lst
+ TARGET_OBJS     := $(addsuffix .o,$(addprefix $(TARGET_OBJ_DIR)/,$(basename $(SRC))))
++
++# included here (before TARGET_OBJS is consumed by the ELF link rule below) so that
++# oot.mk's `TARGET_OBJS += rl_tools/policy.o` actually takes effect
++include ../oot.mk
++
+ TARGET_DEPS     := $(addsuffix .d,$(addprefix $(TARGET_OBJ_DIR)/,$(basename $(SRC))))
+ TARGET_MAP      := $(OBJECT_DIR)/$(FORKNAME)_$(TARGET_NAME).map
+ 
+@@ -777,7 +782,5 @@ $(TARGET_EF_HASH_FILE):
+ # rebuild everything when makefile changes or the extra flags have changed
+ $(TARGET_OBJS): $(TARGET_EF_HASH_FILE) Makefile $(TARGET_DIR)/target.mk $(wildcard make/*) $(CONFIG_FILE)
+ 
+-include ../oot.mk
+-
+ # include auto-generated dependencies
+ -include $(TARGET_DEPS)
+diff --git a/src/main/build/debug.c b/src/main/build/debug.c
+index fb8795bd4..b371cdb9a 100644
+--- a/src/main/build/debug.c
++++ b/src/main/build/debug.c
+@@ -125,4 +125,5 @@ const char * const debugModeNames[DEBUG_COUNT] = {
+     [DEBUG_WING_SETPOINT] = "WING_SETPOINT",
+     [DEBUG_AUTOPILOT_POSITION] = "AUTOPILOT_POSITION",
+     [DEBUG_CHIRP] = "CHIRP",
++    [DEBUG_RAPTOR] = "RAPTOR",
+ };
+diff --git a/src/main/build/debug.h b/src/main/build/debug.h
+index b72ebdb49..8e9cce897 100644
+--- a/src/main/build/debug.h
++++ b/src/main/build/debug.h
+@@ -127,6 +127,7 @@ typedef enum {
+     DEBUG_WING_SETPOINT,
+     DEBUG_AUTOPILOT_POSITION,
+     DEBUG_CHIRP,
++    DEBUG_RAPTOR,
+     DEBUG_COUNT
+ } debugType_e;
+ 
